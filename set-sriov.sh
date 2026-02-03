@@ -91,8 +91,17 @@ for i in $(seq 1 $((TOTAL_VFS - 1))); do
     ip link set dev "$PF_DEV" vf "$i" mac "$NEW_VF_MAC"
 done
 
-# 6. 拉起所有代表端口 (Representors)
-# 匹配该物理口下的所有 v* 端口
-# find "/sys/class/net/${PF_DEV}_v"* -maxdepth 0 -type l -exec basename {} \; 2>/dev/null | xargs -r -I {} ip link set dev {} up
+# 6. 拉起所有代表端口 (devlink 精准版)
+echo "Bringing up representor ports via devlink..."
+devlink port show pci/"$PF_PCI" 2>/dev/null | \
+grep -o "netdev [^ ]*" | \
+awk '{print $2}' | \
+while read iface; do
+    # 跳过 lo (虽然 devlink 通常不显示 lo) 和空的行
+    [ -z "$iface" ] && continue
+    
+    echo "    Setting UP: $iface"
+    ip link set dev "$iface" up
+done
 
 echo ">>> Configuration Complete."
