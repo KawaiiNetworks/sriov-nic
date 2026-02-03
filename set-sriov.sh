@@ -1,10 +1,27 @@
 #!/bin/bash
 set -e # 遇到错误立即退出
 
+# ================= 配置文件加载 =================
+CONFIG_FILE="$1"
+
+if [ -z "$CONFIG_FILE" ]; then
+    echo "Usage: $0 <path-to-config-file>"
+    exit 1
+fi
+
+if [ ! -f "$CONFIG_FILE" ]; then
+    echo "Error: Configuration file '$CONFIG_FILE' not found."
+    exit 1
+fi
+
+# 加载配置文件
+# shellcheck source=/dev/null
+source "$CONFIG_FILE"
+
 # ================= 环境变量检查 =================
-: "${PF_PCI:?Error: Environment variable PF_PCI is not set.}"
-: "${TOTAL_VFS:?Error: Environment variable TOTAL_VFS is not set.}"
-: "${VF_PREFIX:?Error: Environment variable VF_PREFIX (e.g. 02:00:00:00:02) is not set.}"
+: "${PF_PCI:?Error: Variable PF_PCI is not set in $CONFIG_FILE.}"
+: "${TOTAL_VFS:?Error: Variable TOTAL_VFS is not set in $CONFIG_FILE.}"
+: "${VF_PREFIX:?Error: Variable VF_PREFIX is not set in $CONFIG_FILE.}"
 
 # ================= 自动获取网口名 (核心修改) =================
 # 通过 PCI ID 在 sysfs 中反查网口名称

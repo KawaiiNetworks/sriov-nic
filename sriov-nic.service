@@ -5,8 +5,7 @@ After=systemd-modules-load.service
 
 [Service]
 Type=oneshot
-EnvironmentFile=/root/app/sriov-nic/sriov-nic.conf
-ExecStart=/root/app/sriov-nic/set-sriov.sh
+ExecStart=/root/app/sriov-nic/set-sriov.sh /root/app/sriov-nic/sriov-nic.conf
 RemainAfterExit=yes
 TimeoutSec=60
 
