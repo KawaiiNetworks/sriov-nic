@@ -1,0 +1,14 @@
+[Unit]
+Description=Script to enable SR-IOV on boot
+Before=networking.service
+After=systemd-modules-load.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=/root/app/sriov-nic/sriov-nic.conf
+ExecStart=/root/app/sriov-nic/set-sriov.sh
+RemainAfterExit=yes
+TimeoutSec=60
+
+[Install]
+WantedBy=multi-user.target
