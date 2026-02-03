@@ -2,21 +2,37 @@
 set -e # 遇到错误立即退出
 
 # ================= 环境变量检查 =================
-# 使用 Bash 参数扩展检查变量是否存在，不存在则报错退出
-: "${PF_DEV:?Error: Environment variable PF_DEV is not set.}"
 : "${PF_PCI:?Error: Environment variable PF_PCI is not set.}"
 : "${TOTAL_VFS:?Error: Environment variable TOTAL_VFS is not set.}"
 : "${VF_PREFIX:?Error: Environment variable VF_PREFIX (e.g. 02:00:00:00:02) is not set.}"
+
+# ================= 自动获取网口名 (核心修改) =================
+# 通过 PCI ID 在 sysfs 中反查网口名称
+# 路径通常是 /sys/bus/pci/devices/0000:01:00.0/net/enp1s0
+if [ ! -d "/sys/bus/pci/devices/$PF_PCI/net" ]; then
+    echo "Error: No network interface found for PCI device $PF_PCI"
+    echo "       Please verify the PCI ID and ensure the driver is loaded."
+    exit 1
+fi
+
+# 获取该目录下的第一个文件夹名作为网卡名
+PF_DEV=$(ls /sys/bus/pci/devices/$PF_PCI/net/ | head -n 1)
+
+if [ -z "$PF_DEV" ]; then
+    echo "Error: Could not resolve network device name from PCI ID $PF_PCI"
+    exit 1
+fi
 
 # ================= 自动计算配置 =================
 # PF_DUMMY_MAC 自动拼接 :00
 PF_DUMMY_MAC="${VF_PREFIX}:00"
 
-echo ">>> Starting Switchdev Setup for $PF_DEV ($PF_PCI)"
+echo ">>> Starting Switchdev Setup for PCI: $PF_PCI (Detected Interface: $PF_DEV)"
 echo "    PF Dummy MAC: $PF_DUMMY_MAC"
 echo "    VF Prefix:    $VF_PREFIX"
 
 # 1. 获取原厂永久 MAC (留给 VF0 用)
+# ethtool 必须用网卡名，使用我们反查到的 PF_DEV
 ORIG_MAC=$(ethtool -P "$PF_DEV" | awk '{print $3}')
 if [ -z "$ORIG_MAC" ]; then
     echo "Error: Could not read permanent MAC from $PF_DEV"
@@ -24,7 +40,7 @@ if [ -z "$ORIG_MAC" ]; then
 fi
 
 # 2. 清零 VF (销毁旧状态，这比解绑驱动快且稳)
-# echo 0 > "/sys/class/net/$PF_DEV/device/sriov_numvfs"
+# echo 0 > "/sys/bus/pci/devices/$PF_PCI/sriov_numvfs"
 
 # 3. 切换模式
 # 为了防止玄学问题，先切 legacy 再切 switchdev (可选，但推荐)
@@ -32,10 +48,11 @@ fi
 devlink dev eswitch set pci/"$PF_PCI" mode switchdev
 
 # 4. 生成新 VF
-echo "$TOTAL_VFS" > "/sys/class/net/$PF_DEV/device/sriov_numvfs"
+echo "$TOTAL_VFS" > "/sys/bus/pci/devices/$PF_PCI/sriov_numvfs"
 udevadm settle # 等待设备生成
 
 # 5. 修改 MAC 地址
+# 注意：ip link 命令必须使用 Interface Name ($PF_DEV)，不能用 PCI ID
 echo "Configuring MAC addresses..."
 
 # 5.1 先修改物理口 (PF) 为 Dummy MAC (后缀 :00)
