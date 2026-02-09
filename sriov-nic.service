@@ -5,6 +5,8 @@ After=systemd-modules-load.service
 
 [Service]
 Type=oneshot
+ExecStart=/usr/bin/ovs-vsctl set Open_vSwitch . other_config:hw-offload=true
+ExecStart=/usr/bin/systemctl restart openvswitch-switch.service
 ExecStart=/root/app/sriov-nic/set-sriov.sh /root/app/sriov-nic/sriov-nic.conf
 RemainAfterExit=yes
 TimeoutSec=60
