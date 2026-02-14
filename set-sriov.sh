@@ -57,12 +57,14 @@ if [ -z "$ORIG_MAC" ]; then
 fi
 
 # 2. 清零 VF (销毁旧状态，这比解绑驱动快且稳)
-# echo 0 > "/sys/bus/pci/devices/$PF_PCI/sriov_numvfs"
+echo 0 > "/sys/bus/pci/devices/$PF_PCI/sriov_numvfs"
 
 # 3. 切换模式
 # 为了防止玄学问题，先切 legacy 再切 switchdev (可选，但推荐)
 # devlink dev eswitch set pci/"$PF_PCI" mode legacy 2>/dev/null || true
+devlink dev param set pci/"$PF_PCI" name flow_steering_mode value "dmfs" cmode runtime
 devlink dev eswitch set pci/"$PF_PCI" mode switchdev
+devlink dev eswitch set pci/"$PF_PCI" inline-mode transport
 
 # 4. 生成新 VF
 echo "$TOTAL_VFS" > "/sys/bus/pci/devices/$PF_PCI/sriov_numvfs"
