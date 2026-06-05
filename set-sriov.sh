@@ -44,6 +44,24 @@ fi
 # PF_DUMMY_MAC 自动拼接 :00
 PF_DUMMY_MAC="${VF_PREFIX}:00"
 
+# ================= 辅助函数 =================
+# 将指定网口的 rx/tx ring 设置为驱动允许的最大值，不支持时静默跳过
+set_max_ring() {
+    local iface="$1"
+    local max_rx max_tx args=""
+    max_rx=$(ethtool -g "$iface" 2>/dev/null | awk '/Pre-set maximums:/{f=1} f && /^RX:/{print $2; exit}')
+    max_tx=$(ethtool -g "$iface" 2>/dev/null | awk '/Pre-set maximums:/{f=1} f && /^TX:/{print $2; exit}')
+    [ -z "$max_rx" ] && [ -z "$max_tx" ] && { echo "    Ring: $iface (not supported, skipped)"; return 0; }
+    [ -n "$max_rx" ] && args="rx $max_rx"
+    [ -n "$max_tx" ] && args="$args tx $max_tx"
+    # shellcheck disable=SC2086
+    if ethtool -G "$iface" $args 2>/dev/null; then
+        echo "    Ring: $iface rx=${max_rx:-n/a} tx=${max_tx:-n/a} -> max"
+    else
+        echo "    Ring: $iface (set failed, skipped)"
+    fi
+}
+
 echo ">>> Starting Switchdev Setup for PCI: $PF_PCI (Detected Interface: $PF_DEV)"
 echo "    PF Dummy MAC: $PF_DUMMY_MAC"
 echo "    VF Prefix:    $VF_PREFIX"
@@ -70,6 +88,13 @@ devlink dev eswitch set pci/"$PF_PCI" inline-mode transport
 echo "$TOTAL_VFS" > "/sys/bus/pci/devices/$PF_PCI/sriov_numvfs"
 udevadm settle # 等待设备生成
 
+# 4.1 设置 VF netdev 的 ring 为最大值
+echo "Setting max ring sizes for VF netdevs..."
+for i in $(seq 0 $((TOTAL_VFS - 1))); do
+    vf_dev=$(ls "/sys/bus/pci/devices/$PF_PCI/virtfn${i}/net/" 2>/dev/null | head -n 1)
+    [ -n "$vf_dev" ] && set_max_ring "$vf_dev"
+done
+
 # 5. 修改 MAC 地址
 # 注意：ip link 命令必须使用 Interface Name ($PF_DEV)，不能用 PCI ID
 echo "Configuring MAC addresses..."
@@ -78,6 +103,7 @@ echo "Configuring MAC addresses..."
 ip link set dev "$PF_DEV" down
 ip link set dev "$PF_DEV" address "$PF_DUMMY_MAC"
 ip link set dev "$PF_DEV" up
+set_max_ring "$PF_DEV"
 
 # 5.2 VF 0 继承原厂物理 MAC
 ip link set dev "$PF_DEV" vf 0 mac "$ORIG_MAC"
@@ -93,17 +119,18 @@ for i in $(seq 1 $((TOTAL_VFS - 1))); do
     ip link set dev "$PF_DEV" vf "$i" mac "$NEW_VF_MAC"
 done
 
-# 6. 拉起所有代表端口 (devlink 精准版)
-echo "Bringing up representor ports via devlink..."
+# 6. 拉起所有代表端口并设置 ring 为最大值 (devlink 精准版)
+echo "Bringing up representor ports and setting max ring sizes..."
 devlink port show pci/"$PF_PCI" 2>/dev/null | \
 grep -o "netdev [^ ]*" | \
 awk '{print $2}' | \
 while read iface; do
     # 跳过 lo (虽然 devlink 通常不显示 lo) 和空的行
     [ -z "$iface" ] && continue
-    
+
     echo "    Setting UP: $iface"
     ip link set dev "$iface" up
+    set_max_ring "$iface"
 done
 
 echo ">>> Configuration Complete."
