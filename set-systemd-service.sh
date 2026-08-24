@@ -1,13 +1,25 @@
-#!/bin/bash
-
-set -e
+#!/usr/bin/env bash
+set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SERVICE_PATH=/etc/systemd/system/sriov-nic.service
 
-# Generate service file from template with correct path and install it
-sed "s|%INSTALL_DIR%|$SCRIPT_DIR|g" "$SCRIPT_DIR/sriov-nic.service" | tee /etc/systemd/system/sriov-nic.service > /dev/null
+if [[ "$EUID" -ne 0 ]]; then
+    echo "Error: run this installer as root." >&2
+    exit 1
+fi
 
-# Reload systemd daemon to recognize the new service
+for script in set-sriov.sh set-sriov-all.sh prepare-ovs.sh; do
+    [[ -x "$SCRIPT_DIR/$script" ]] || {
+        echo "Error: $SCRIPT_DIR/$script is missing or not executable." >&2
+        exit 1
+    }
+done
+
+sed "s|%INSTALL_DIR%|$SCRIPT_DIR|g" "$SCRIPT_DIR/sriov-nic.service" >"$SERVICE_PATH"
+chmod 0644 "$SERVICE_PATH"
 systemctl daemon-reload
 
-echo "SR-IOV systemd service has been installed and systemd daemon reloaded."
+echo "Installed $SERVICE_PATH"
+echo "Enable it after testing your configuration manually:"
+echo "  systemctl enable --now sriov-nic.service"

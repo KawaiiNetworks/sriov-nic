@@ -1,15 +1,15 @@
 [Unit]
-Description=Script to enable SR-IOV on boot
+Description=Configure SR-IOV NIC physical functions
+After=systemd-modules-load.service systemd-udev-settle.service network-pre.target
 Before=networking.service
-After=systemd-modules-load.service
+Wants=systemd-udev-settle.service network-pre.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/ovs-vsctl set Open_vSwitch . other_config:hw-offload=true
-ExecStart=/usr/bin/systemctl restart openvswitch-switch.service
+ExecStartPre=%INSTALL_DIR%/prepare-ovs.sh
 ExecStart=%INSTALL_DIR%/set-sriov-all.sh
 RemainAfterExit=yes
-TimeoutSec=60
+TimeoutStartSec=180
 
 [Install]
 WantedBy=multi-user.target
