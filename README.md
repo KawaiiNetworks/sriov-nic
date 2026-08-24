@@ -62,7 +62,8 @@ sudo ./set-sriov.sh --interactive
 4. 选择 VF 数量；
 5. 选择 MAC 策略与 ring 调优；
 6. 显示摘要，并要求输入大写 `APPLY` 后才执行；
-7. 成功后可保存为 `sriov-nic.conf.<接口名>`。
+7. 成功后可保存为 `sriov-nic.conf.<接口名>`；
+8. 若配置保存在脚本目录中，会进一步询问是否**安装并启用** `sriov-nic.service`，让该配置在开机时自动重放。
 
 只查看可用 PF，不修改系统：
 
@@ -232,17 +233,16 @@ sudo ./set-sriov-all.sh
 
 ## 开机自动配置
 
-请先手动应用并确认配置正确，再安装服务。修改后的项目必须放在固定路径。可以复制当前工作目录，或从包含这些修改的自有分支克隆，例如：
+交互向导在配置保存到脚本目录后，会直接询问是否**安装并启用** `sriov-nic.service`；同意后它会调用 `set-systemd-service.sh` 并执行 `systemctl enable sriov-nic.service`。
+
+也可以手动执行（效果相同）：
 
 ```bash
-sudo cp -a /path/to/modified/sriov-nic /opt/sriov-nic
-cd /opt/sriov-nic
-sudo ./set-sriov.sh --interactive --save ./sriov-nic.conf.pf0
-sudo ./set-systemd-service.sh
+sudo ./set-systemd-service.sh          # 生成 /etc/systemd/system/sriov-nic.service
 sudo systemctl enable sriov-nic.service
 ```
 
-安装服务后不要移动或删除该目录，因为生成的 unit 中保存了绝对路径。
+请先手动应用并确认配置正确，且项目目录要放在固定路径（如 `/opt/sriov-nic`），因为生成的 unit 中保存的是绝对路径。安装服务后不要移动或删除该目录。
 
 测试服务：
 

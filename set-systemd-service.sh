@@ -2,7 +2,9 @@
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SERVICE_PATH=/etc/systemd/system/sriov-nic.service
+# Overridable destinations so the installer can be tested or repackaged.
+UNIT_PATH="${SRIOV_UNIT_PATH:-/etc/systemd/system/sriov-nic.service}"
+SYSTEMCTL="${SRIOV_SYSTEMCTL:-systemctl}"
 
 if [[ "$EUID" -ne 0 ]]; then
     echo "Error: run this installer as root." >&2
@@ -16,10 +18,11 @@ for script in set-sriov.sh set-sriov-all.sh prepare-ovs.sh; do
     }
 done
 
-sed "s|%INSTALL_DIR%|$SCRIPT_DIR|g" "$SCRIPT_DIR/sriov-nic.service" >"$SERVICE_PATH"
-chmod 0644 "$SERVICE_PATH"
-systemctl daemon-reload
+mkdir -p "$(dirname "$UNIT_PATH")"
+sed "s|%INSTALL_DIR%|$SCRIPT_DIR|g" "$SCRIPT_DIR/sriov-nic.service" >"$UNIT_PATH"
+chmod 0644 "$UNIT_PATH"
+"$SYSTEMCTL" daemon-reload
 
-echo "Installed $SERVICE_PATH"
+echo "Installed $UNIT_PATH"
 echo "Enable it after testing your configuration manually:"
-echo "  systemctl enable --now sriov-nic.service"
+echo "  $SYSTEMCTL enable --now sriov-nic.service"
