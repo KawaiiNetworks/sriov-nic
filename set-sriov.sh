@@ -25,6 +25,7 @@ SET_MAX_RING=""
 BRING_REPRESENTORS_UP=""
 ENABLE_HW_TC_OFFLOAD=""
 FLOW_STEERING_MODE=""
+FLOW_STEERING_RECOMMENDED=false
 INLINE_MODE=""
 ENCAP_MODE=""
 OVS_HW_OFFLOAD=""
@@ -541,12 +542,12 @@ interactive_setup() {
         ENABLE_HW_TC_OFFLOAD=true
         case "$DRIVER" in
             mlx5_core)
-                # ConnectX-5/6/7: SMFS inserts steering rules faster than the
-                # firmware-managed DMFS path. Modern mlx5 needs no forced
-                # transport inline mode, so leave the e-switch value unchanged.
-                FLOW_STEERING_MODE=smfs
+                # Prefer SMFS, but some OEM firmware exposes the parameter
+                # without supporting SMFS. The recommended profile falls back
+                # to the current runtime mode instead of aborting.
+                FLOW_STEERING_MODE=recommended
                 INLINE_MODE=auto
-                echo "Recommended mlx5 profile: flow steering=smfs, inline=auto."
+                echo "Recommended mlx5 profile: try smfs (fallback supported), inline=auto."
                 ;;
             ice)
                 # Intel ice selects suitable steering/inline defaults itself.
@@ -716,7 +717,9 @@ validate_settings() {
     INLINE_MODE="${INLINE_MODE,,}"
     ENCAP_MODE="${ENCAP_MODE,,}"
 
+    FLOW_STEERING_RECOMMENDED=false
     if [[ "$FLOW_STEERING_MODE" == recommended ]]; then
+        FLOW_STEERING_RECOMMENDED=true
         if [[ "$MODE" == switchdev && "$DRIVER" == mlx5_core ]]; then
             FLOW_STEERING_MODE=smfs
         else
@@ -766,17 +769,47 @@ set_max_ring() {
     fi
 }
 
+get_devlink_param_runtime_value() {
+    local name="$1"
+
+    devlink dev param show "pci/$PF_PCI" name "$name" 2>/dev/null |
+        awk '$1 == "cmode" && $2 == "runtime" && $3 == "value" {print $4; exit}'
+}
+
 set_optional_devlink_param() {
     local name="$1"
     local value="$2"
+    local best_effort="${3:-false}"
+    local current="" error_output=""
 
     [[ "$value" != auto && -n "$value" ]] || return 0
-    if devlink dev param show "pci/$PF_PCI" name "$name" >/dev/null 2>&1; then
-        echo "Setting devlink parameter $name=$value..."
-        devlink dev param set "pci/$PF_PCI" name "$name" value "$value" cmode runtime
-    else
+    if ! devlink dev param show "pci/$PF_PCI" name "$name" >/dev/null 2>&1; then
+        if [[ "$best_effort" == true ]]; then
+            warn "Recommended devlink parameter '$name' is unavailable; leaving it unchanged."
+            [[ "$name" == flow_steering_mode ]] && FLOW_STEERING_MODE=auto
+            return 0
+        fi
         warn "devlink parameter '$name' is unavailable on driver $DRIVER; skipped."
+        return 0
     fi
+
+    echo "Setting devlink parameter $name=$value..."
+    if error_output=$(devlink dev param set "pci/$PF_PCI" name "$name" \
+        value "$value" cmode runtime 2>&1); then
+        return 0
+    fi
+
+    if [[ "$best_effort" == true ]]; then
+        current=$(get_devlink_param_runtime_value "$name" || true)
+        warn "Recommended $name=$value is unsupported by this device; using ${current:-the current driver value}."
+        [[ -n "$error_output" ]] && echo "    Driver response: $error_output" >&2
+        if [[ "$name" == flow_steering_mode ]]; then
+            FLOW_STEERING_MODE="${current:-auto}"
+        fi
+        return 0
+    fi
+    [[ -n "$error_output" ]] && printf '%s\n' "$error_output" >&2
+    return 1
 }
 
 set_optional_eswitch_attr() {
@@ -977,7 +1010,8 @@ apply_configuration() {
     settle_devices
 
     if [[ "$MODE" == switchdev ]]; then
-        set_optional_devlink_param flow_steering_mode "$FLOW_STEERING_MODE"
+        set_optional_devlink_param flow_steering_mode "$FLOW_STEERING_MODE" \
+            "$FLOW_STEERING_RECOMMENDED"
 
         echo "Switching the e-switch to switchdev mode..."
         devlink dev eswitch set "pci/$PF_PCI" mode switchdev

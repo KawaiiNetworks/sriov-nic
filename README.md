@@ -15,7 +15,7 @@
 |---|---:|---:|---|
 | Intel XXV710 / `i40e` | 是 | 否 | 使用 `MODE=sriov`；没有 VF representor |
 | Intel E810 / `ice` | 是 | 视内核、固件而定 | 用 `devlink dev eswitch show` 确认 |
-| NVIDIA/Mellanox ConnectX / `mlx5_core` | 是 | 视型号、固件而定 | 交互模式默认使用 `smfs`，并保留驱动的 inline mode |
+| NVIDIA/Mellanox ConnectX / `mlx5_core` | 是 | 视型号、固件而定 | 推荐 profile 尝试 `smfs`；不支持时自动回退到当前 steering mode |
 | 其他 SR-IOV 网卡 | 通常可以 | 自动检测 | 普通模式只依赖标准 SR-IOV sysfs 接口 |
 
 出现于 `devlink dev show` 中，并不等于支持 switchdev。必须确认下面的命令成功：
@@ -162,11 +162,13 @@ OVS_HW_OFFLOAD=true
 对于 ConnectX-5/6/7 等现代 `mlx5_core` 网卡，推荐：
 
 ```bash
-FLOW_STEERING_MODE=smfs
+FLOW_STEERING_MODE=recommended
 INLINE_MODE=auto
 ```
 
-`smfs` 由驱动直接管理硬件 steering，规则插入速度通常优于固件管理的 `dmfs`；`INLINE_MODE=auto` 表示保留硬件/驱动当前值，不再无条件强制 `transport`。交互向导会自动使用这一 profile。
+`recommended` 会尝试 `smfs`：它由驱动直接管理硬件 steering，规则插入速度通常优于固件管理的 `dmfs`。部分 OEM 网卡/固件虽然暴露该参数，但不支持 SMFS；此时脚本会读取当前 runtime 值（通常为 `dmfs`）、给出警告并继续，而不会在 VF 已清零后中止。显式配置 `FLOW_STEERING_MODE=smfs` 仍采用严格模式，设置失败会报错退出。
+
+`INLINE_MODE=auto` 表示保留硬件/驱动当前值，不再无条件强制 `transport`。交互向导自动使用上述推荐 profile，并在保存配置时写入最终实际模式。
 
 应用并检查：
 
@@ -195,7 +197,7 @@ devlink port show pci/0000:03:00.0
 | `SET_MAX_RING` | `true` / `false` | 尝试将支持的 RX/TX ring 调至最大，失败时跳过 |
 | `BRING_REPRESENTORS_UP` | `auto` / `true` / `false` | 拉起 VF/SF representor；`auto` 在 switchdev 开启、普通 SR-IOV 关闭 |
 | `ENABLE_HW_TC_OFFLOAD` | `auto` / `true` / `false` | 为 PF uplink、VF/SF representor 及主机可见 VF 自动执行 `ethtool -K ... hw-tc-offload on`；`auto` 在 switchdev 开启、普通 SR-IOV 关闭 |
-| `FLOW_STEERING_MODE` | `recommended` / `auto` / `dmfs` / `smfs` / 驱动值 | `recommended` 选择内置网卡 profile；`auto` 表示不修改；现代 mlx5 profile 使用 `smfs` |
+| `FLOW_STEERING_MODE` | `recommended` / `auto` / `dmfs` / `smfs` / 驱动值 | `recommended` 在 mlx5 尝试 `smfs` 并自动回退到当前值；`auto` 表示不修改；显式值设置失败会退出 |
 | `INLINE_MODE` | `recommended` / `auto` / `none` / `link` / `network` / `transport` | `recommended` 使用网卡 profile；`auto` 表示不修改 e-switch 当前值 |
 | `ENCAP_MODE` | `auto` / `none` / `basic` | 可选 e-switch 属性 |
 | `OVS_HW_OFFLOAD` | `true` / `false` | 开机服务是否启用并重启 OVS；普通 SR-IOV 应为 `false` |
