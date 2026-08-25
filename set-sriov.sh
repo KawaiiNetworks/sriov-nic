@@ -1010,6 +1010,47 @@ set_optional_eswitch_attr() {
     fi
 }
 
+set_eswitch_mode() {
+    local target="$1"
+    local retries="${ESWITCH_MODE_RETRIES:-10}"
+    local delay="${ESWITCH_MODE_RETRY_DELAY:-0.5}"
+    local attempt output info current
+
+    [[ "$retries" =~ ^[1-9][0-9]*$ ]] || retries=10
+    [[ "$delay" =~ ^[0-9]+([.][0-9]+)?$ ]] || delay=0.5
+
+    if info=$(get_eswitch_info "$PF_PCI"); then
+        current=$(get_eswitch_mode "$info")
+        if [[ "$current" == "$target" ]]; then
+            echo "The e-switch is already in $target mode; skipped."
+            return 0
+        fi
+    fi
+
+    for ((attempt = 1; attempt <= retries; attempt++)); do
+        if output=$(devlink dev eswitch set "pci/$PF_PCI" mode "$target" 2>&1); then
+            [[ -n "$output" ]] && printf '%s\n' "$output"
+            return 0
+        fi
+
+        if [[ "$DRIVER" != mlx5_core ]] ||
+           ! grep -qiE 'e-?switch is busy|device (is )?busy|resource busy' <<<"$output"; then
+            [[ -n "$output" ]] && printf '%s\n' "$output" >&2
+            return 1
+        fi
+
+        if (( attempt < retries )); then
+            warn "mlx5 E-Switch is still busy after VF removal; retrying mode=$target ($attempt/$retries)..."
+            sleep "$delay"
+        fi
+    done
+
+    [[ -n "$output" ]] && printf '%s\n' "$output" >&2
+    warn "mlx5 E-Switch remained busy after $retries attempts."
+    warn "Persistent users may include OVS/TC flower rules, representor operations, LAG/bond, IPsec offload, or a firmware reset."
+    return 1
+}
+
 settle_devices() {
     if command_exists udevadm; then
         if ! udevadm settle; then
@@ -1197,7 +1238,7 @@ apply_uninstall() {
         mode=$(get_eswitch_mode "$info")
         if [[ "$mode" != legacy ]]; then
             echo "Switching the e-switch from $mode to legacy mode..."
-            devlink dev eswitch set "pci/$PF_PCI" mode legacy
+            set_eswitch_mode legacy
         else
             echo "The e-switch is already in legacy mode."
         fi
@@ -1273,6 +1314,7 @@ apply_configuration() {
     fi
 
     echo ">>> Configuring $PF_PCI ($PF_DEV, driver $DRIVER) in $MODE mode"
+    echo "    Plan: e-switch ${current_mode}->${target_mode} (change=$mode_change), VFs ${current}->${TOTAL_VFS} (recreate=$recreate_vfs)"
     if [[ "$recreate_vfs" == true ]]; then
         echo "Removing $current existing VF(s)..."
         printf '0\n' >"$sriov_file"
@@ -1287,7 +1329,7 @@ apply_configuration() {
 
         if [[ "$mode_change" == true ]]; then
             echo "Switching the e-switch from $current_mode to switchdev mode..."
-            devlink dev eswitch set "pci/$PF_PCI" mode switchdev
+            set_eswitch_mode switchdev
         else
             echo "The e-switch is already in switchdev mode; skipping mode change."
         fi
@@ -1302,7 +1344,7 @@ apply_configuration() {
             fi
         elif [[ "$mode_change" == true ]]; then
             echo "Switching the e-switch from $current_mode to legacy mode..."
-            devlink dev eswitch set "pci/$PF_PCI" mode legacy
+            set_eswitch_mode legacy
         else
             echo "The e-switch is already in legacy mode; skipping mode change."
         fi
