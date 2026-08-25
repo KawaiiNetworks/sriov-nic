@@ -15,7 +15,7 @@
 |---|---:|---:|---|
 | Intel XXV710 / `i40e` | 是 | 否 | 使用 `MODE=sriov`；没有 VF representor |
 | Intel E810 / `ice` | 是 | 视内核、固件而定 | 用 `devlink dev eswitch show` 确认 |
-| NVIDIA/Mellanox ConnectX / `mlx5_core` | 是 | 视型号、固件而定 | 交互模式会默认尝试 `dmfs` 与 `inline-mode transport` |
+| NVIDIA/Mellanox ConnectX / `mlx5_core` | 是 | 视型号、固件而定 | 交互模式默认使用 `smfs`，并保留驱动的 inline mode |
 | 其他 SR-IOV 网卡 | 通常可以 | 自动检测 | 普通模式只依赖标准 SR-IOV sysfs 接口 |
 
 出现于 `devlink dev show` 中，并不等于支持 switchdev。必须确认下面的命令成功：
@@ -60,7 +60,7 @@ sudo ./set-sriov.sh --interactive
 2. 显示接口名、PCI 地址、驱动、当前/最大 VF 数量和 switchdev 能力；
 3. 选择普通 SR-IOV 或 switchdev；
 4. 选择 VF 数量；
-5. 选择 MAC 策略与 ring 调优；
+5. 选择 MAC 策略、ring 调优、NIC TC offload 与 OVS offload；mlx5/ice 会应用各自推荐的 switchdev profile；
 6. 显示摘要，并要求输入大写 `APPLY` 后才执行；
 7. 成功后可保存为 `sriov-nic.conf.<接口名>`；
 8. 若配置保存在脚本目录中，会进一步询问是否**安装并启用** `sriov-nic.service`，让该配置在开机时自动重放。
@@ -107,6 +107,7 @@ VF_PREFIX=02:00:00:03:00
 
 SET_MAX_RING=true
 BRING_REPRESENTORS_UP=false
+ENABLE_HW_TC_OFFLOAD=false
 FLOW_STEERING_MODE=auto
 INLINE_MODE=auto
 ENCAP_MODE=auto
@@ -147,6 +148,7 @@ MAC_MODE=none
 VF_PREFIX=02:00:00:03:00
 SET_MAX_RING=true
 BRING_REPRESENTORS_UP=true
+ENABLE_HW_TC_OFFLOAD=true
 
 # 通用/Intel ice 通常保持 auto；脚本只执行硬件实际暴露的属性。
 FLOW_STEERING_MODE=auto
@@ -157,12 +159,14 @@ ENCAP_MODE=auto
 OVS_HW_OFFLOAD=true
 ```
 
-对于支持相关参数的 `mlx5_core` 网卡，可以改为：
+对于 ConnectX-5/6/7 等现代 `mlx5_core` 网卡，推荐：
 
 ```bash
-FLOW_STEERING_MODE=dmfs
-INLINE_MODE=transport
+FLOW_STEERING_MODE=smfs
+INLINE_MODE=auto
 ```
+
+`smfs` 由驱动直接管理硬件 steering，规则插入速度通常优于固件管理的 `dmfs`；`INLINE_MODE=auto` 表示保留硬件/驱动当前值，不再无条件强制 `transport`。交互向导会自动使用这一 profile。
 
 应用并检查：
 
@@ -173,6 +177,8 @@ devlink port show pci/0000:03:00.0
 ```
 
 脚本在切换模式前会先将 `sriov_numvfs` 设为 `0`，再切换 e-switch，最后重新创建 VF。这同时满足 `ice` 等驱动“存在 VF 时不允许切换模式”的要求。
+
+现代 mlx5 内核可能把 Ethernet devlink 端口暴露为父 PCI devlink 的 nested auxiliary 实例，例如 `auxiliary/mlx5_core.eth.0`。脚本会同时遍历父/嵌套 devlink，并在旧版 iproute2 上通过相同 `phys_switch_id` 与 `phys_port_name` 回退识别 representor。
 
 ## 配置项
 
@@ -186,13 +192,23 @@ devlink port show pci/0000:03:00.0
 |  | `move-pf-to-vf0` | 将 PF 永久 MAC 交给 VF 0，并修改 PF MAC；兼容原仓库行为 |
 | `VF_PREFIX` | 五个 MAC 字节 | 如 `02:00:00:03:00`；每张 PF 应唯一 |
 | `SET_MAX_RING` | `true` / `false` | 尝试将支持的 RX/TX ring 调至最大，失败时跳过 |
-| `BRING_REPRESENTORS_UP` | `true` / `false` | switchdev 下拉起 representor |
-| `FLOW_STEERING_MODE` | `auto` / 驱动值 | `auto` 表示不修改；`dmfs` 主要用于 mlx5 |
-| `INLINE_MODE` | `auto` / `none` / `link` / `network` / `transport` | 可选 e-switch 属性 |
+| `BRING_REPRESENTORS_UP` | `auto` / `true` / `false` | 拉起 VF/SF representor；`auto` 在 switchdev 开启、普通 SR-IOV 关闭 |
+| `ENABLE_HW_TC_OFFLOAD` | `auto` / `true` / `false` | 为 PF uplink、VF/SF representor 及主机可见 VF 自动执行 `ethtool -K ... hw-tc-offload on`；`auto` 在 switchdev 开启、普通 SR-IOV 关闭 |
+| `FLOW_STEERING_MODE` | `recommended` / `auto` / `dmfs` / `smfs` / 驱动值 | `recommended` 选择内置网卡 profile；`auto` 表示不修改；现代 mlx5 profile 使用 `smfs` |
+| `INLINE_MODE` | `recommended` / `auto` / `none` / `link` / `network` / `transport` | `recommended` 使用网卡 profile；`auto` 表示不修改 e-switch 当前值 |
 | `ENCAP_MODE` | `auto` / `none` / `basic` | 可选 e-switch 属性 |
 | `OVS_HW_OFFLOAD` | `true` / `false` | 开机服务是否启用并重启 OVS；普通 SR-IOV 应为 `false` |
 
 配置文件通过 Bash `source` 加载，因此只应使用自己信任的配置文件。
+
+### NIC TC offload 与 OVS offload
+
+两项配置彼此独立：
+
+- `ENABLE_HW_TC_OFFLOAD=true` 为所选 PF 的 uplink、VF/SF representor 和主机可见 VF 执行 `ethtool -K <接口> hw-tc-offload on`；不支持该 feature 的接口会跳过并给出警告。
+- `OVS_HW_OFFLOAD=true` 让开机 helper 设置 OVS 全局 `other_config:hw-offload=true` 并重启 OVS。
+
+OVS TC flower 硬件卸载仍使用默认 `system` datapath；不要把 bridge 的 `datapath_type` 设置为 `tc`。实际卸载还要求 representor 被加入 OVS bridge，这属于网络拓扑配置，不由本项目自动完成。
 
 ### MAC 策略说明
 
@@ -284,6 +300,7 @@ MODE=switchdev
 MAC_MODE=move-pf-to-vf0
 FLOW_STEERING_MODE=dmfs
 INLINE_MODE=transport
+ENABLE_HW_TC_OFFLOAD=true
 OVS_HW_OFFLOAD=true
 ```
 

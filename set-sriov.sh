@@ -23,6 +23,7 @@ MAC_MODE=""
 VF_PREFIX=""
 SET_MAX_RING=""
 BRING_REPRESENTORS_UP=""
+ENABLE_HW_TC_OFFLOAD=""
 FLOW_STEERING_MODE=""
 INLINE_MODE=""
 ENCAP_MODE=""
@@ -75,20 +76,111 @@ normalize_pci() {
     printf '%s\n' "$pci"
 }
 
-get_devlink_ports() {
+get_devlink_handles() {
     local pci="$1"
     local output
 
     command_exists devlink || return 1
 
-    # Newer iproute2 supports a device selector here. Fall back to listing all
-    # ports for older versions whose parser only accepts DEV/PORT_INDEX.
-    if output=$(devlink port show "pci/$pci" 2>/dev/null); then
-        awk -v prefix="pci/$pci/" 'index($1, prefix) == 1' <<<"$output"
-        return 0
-    fi
+    # Modern mlx5 exposes Ethernet ports through a nested auxiliary devlink
+    # (for example auxiliary/mlx5_core.eth.0) while e-switch controls remain
+    # on the parent PCI devlink. Return both parent and nested handles.
+    {
+        printf 'pci/%s\n' "$pci"
+        if output=$(devlink dev show "pci/$pci" 2>/dev/null); then
+            awk '{
+                for (i = 1; i <= NF; i++) {
+                    handle = $i
+                    sub(/:$/, "", handle)
+                    if (handle ~ /^(pci|auxiliary|platform)\/[^[:space:]]+$/)
+                        print handle
+                }
+            }' <<<"$output"
+        fi
+    } | awk 'NF && !seen[$0]++'
+}
+
+get_devlink_ports() {
+    local pci="$1"
+    local output handles handle
+
+    command_exists devlink || return 1
     output=$(devlink port show 2>/dev/null) || return 1
-    awk -v prefix="pci/$pci/" 'index($1, prefix) == 1' <<<"$output"
+    handles=$(get_devlink_handles "$pci") || return 1
+
+    while IFS= read -r handle; do
+        [[ -n "$handle" ]] || continue
+        awk -v prefix="$handle/" 'index($1, prefix) == 1' <<<"$output"
+    done <<<"$handles" | awk 'NF && !seen[$0]++'
+}
+
+get_representor_netdevs() {
+    local pci="$1"
+    local pf_dev="$2"
+    local pfnum="${pci##*.}"
+    local port_output switch_id iface port_name path device_path
+
+    {
+        # Preferred path: devlink precisely identifies PCI VF/SF representors.
+        if port_output=$(get_devlink_ports "$pci"); then
+            awk '/flavour pci(vf|sf)/ {
+                for (i = 1; i <= NF; i++)
+                    if ($i == "netdev") { print $(i + 1); break }
+            }' <<<"$port_output"
+        fi
+
+        # Fallback for older devlink/iproute2 combinations: representors share
+        # the PF phys_switch_id and use names such as pf0vf0 or c0pf0sf1.
+        switch_id=$(cat "$SYSFS_ROOT/class/net/$pf_dev/phys_switch_id" 2>/dev/null || true)
+        if [[ -n "$switch_id" ]]; then
+            for path in "$SYSFS_ROOT"/class/net/*; do
+                [[ -e "$path" ]] || continue
+                iface=$(basename "$path")
+                [[ "$iface" != "$pf_dev" ]] || continue
+                [[ "$(cat "$path/phys_switch_id" 2>/dev/null || true)" == "$switch_id" ]] || continue
+                if [[ -e "$path/device" ]]; then
+                    device_path=$(readlink -f "$path/device" 2>/dev/null || true)
+                    [[ "$device_path" == *"/$pci/"* || "$device_path" == *"/$pci" ]] || continue
+                fi
+                port_name=$(cat "$path/phys_port_name" 2>/dev/null || true)
+                # PCI function number normally maps to mlx5/ice PF number;
+                # restricting it avoids capturing representors of another PF
+                # that shares the same hardware switch ID.
+                if [[ "$port_name" =~ ^(c[0-9]+)?pf${pfnum}(vf|sf)[0-9]+$ ]]; then
+                    printf '%s\n' "$iface"
+                fi
+            done
+        fi
+    } | awk 'NF && !seen[$0]++'
+}
+
+get_managed_netdevs() {
+    local pci="$1"
+    local pf_dev="$2"
+    local port_output net_dir path
+
+    {
+        printf '%s\n' "$pf_dev"
+
+        # Include physical and representor netdevs from parent/nested devlinks.
+        if port_output=$(get_devlink_ports "$pci"); then
+            awk '{
+                for (i = 1; i <= NF; i++)
+                    if ($i == "netdev") { print $(i + 1); break }
+            }' <<<"$port_output"
+        fi
+
+        get_representor_netdevs "$pci" "$pf_dev"
+
+        # Also include host-bound VF netdevs. Passthrough VFs may have none.
+        for net_dir in "$SYSFS_ROOT/bus/pci/devices/$pci"/virtfn*/net; do
+            [[ -d "$net_dir" ]] || continue
+            for path in "$net_dir"/*; do
+                [[ -e "$path" ]] || continue
+                basename "$path"
+            done
+        done
+    } | awk 'NF && !seen[$0]++'
 }
 
 get_pf_netdev() {
@@ -389,6 +481,7 @@ interactive_setup() {
     fi
 
     BRING_REPRESENTORS_UP=false
+    ENABLE_HW_TC_OFFLOAD=false
     FLOW_STEERING_MODE=auto
     INLINE_MODE=auto
     ENCAP_MODE=auto
@@ -396,10 +489,24 @@ interactive_setup() {
 
     if [[ "$MODE" == switchdev ]]; then
         BRING_REPRESENTORS_UP=true
-        if [[ "$DRIVER" == mlx5_core ]]; then
-            # Preserve the tuning used by the original mlx5-oriented script.
-            FLOW_STEERING_MODE=dmfs
-            INLINE_MODE=transport
+        ENABLE_HW_TC_OFFLOAD=true
+        case "$DRIVER" in
+            mlx5_core)
+                # ConnectX-5/6/7: SMFS inserts steering rules faster than the
+                # firmware-managed DMFS path. Modern mlx5 needs no forced
+                # transport inline mode, so leave the e-switch value unchanged.
+                FLOW_STEERING_MODE=smfs
+                INLINE_MODE=auto
+                echo "Recommended mlx5 profile: flow steering=smfs, inline=auto."
+                ;;
+            ice)
+                # Intel ice selects suitable steering/inline defaults itself.
+                echo "Recommended ice profile: keep driver steering and inline defaults."
+                ;;
+        esac
+
+        if ! prompt_yes_no "Enable hardware TC offload on all managed NIC ports?" yes; then
+            ENABLE_HW_TC_OFFLOAD=false
         fi
         if command_exists ovs-vsctl &&
            prompt_yes_no "Enable Open vSwitch hardware offload when saved configs run at boot?" yes; then
@@ -416,8 +523,8 @@ load_config() {
 
     # Config files are shell fragments and must therefore be trusted.
     unset MODE PF_PCI TOTAL_VFS MAC_MODE VF_PREFIX SET_MAX_RING
-    unset BRING_REPRESENTORS_UP FLOW_STEERING_MODE INLINE_MODE ENCAP_MODE
-    unset OVS_HW_OFFLOAD
+    unset BRING_REPRESENTORS_UP ENABLE_HW_TC_OFFLOAD
+    unset FLOW_STEERING_MODE INLINE_MODE ENCAP_MODE OVS_HW_OFFLOAD
     # shellcheck source=/dev/null
     source "$file"
 
@@ -437,20 +544,17 @@ load_config() {
         OVS_HW_OFFLOAD="${OVS_HW_OFFLOAD:-true}"
     else
         MAC_MODE="${MAC_MODE:-none}"
-        FLOW_STEERING_MODE="${FLOW_STEERING_MODE:-auto}"
-        INLINE_MODE="${INLINE_MODE:-auto}"
+        # "recommended" is resolved after the PF driver is known. Explicit
+        # values (including auto = leave unchanged) remain authoritative.
+        FLOW_STEERING_MODE="${FLOW_STEERING_MODE:-recommended}"
+        INLINE_MODE="${INLINE_MODE:-recommended}"
         OVS_HW_OFFLOAD="${OVS_HW_OFFLOAD:-false}"
     fi
 
     VF_PREFIX="${VF_PREFIX:-}"
     SET_MAX_RING="${SET_MAX_RING:-true}"
-    if [[ -z "${BRING_REPRESENTORS_UP+x}" ]]; then
-        if [[ "${MODE,,}" == switchdev ]]; then
-            BRING_REPRESENTORS_UP=true
-        else
-            BRING_REPRESENTORS_UP=false
-        fi
-    fi
+    BRING_REPRESENTORS_UP="${BRING_REPRESENTORS_UP:-auto}"
+    ENABLE_HW_TC_OFFLOAD="${ENABLE_HW_TC_OFFLOAD:-auto}"
     ENCAP_MODE="${ENCAP_MODE:-auto}"
 }
 
@@ -472,8 +576,26 @@ validate_settings() {
 
     SET_MAX_RING=$(normalize_bool "$SET_MAX_RING") || \
         die "SET_MAX_RING must be true or false."
-    BRING_REPRESENTORS_UP=$(normalize_bool "$BRING_REPRESENTORS_UP") || \
-        die "BRING_REPRESENTORS_UP must be true or false."
+    if [[ "${BRING_REPRESENTORS_UP,,}" == auto ]]; then
+        if [[ "$MODE" == switchdev ]]; then
+            BRING_REPRESENTORS_UP=true
+        else
+            BRING_REPRESENTORS_UP=false
+        fi
+    else
+        BRING_REPRESENTORS_UP=$(normalize_bool "$BRING_REPRESENTORS_UP") || \
+            die "BRING_REPRESENTORS_UP must be auto, true, or false."
+    fi
+    if [[ "${ENABLE_HW_TC_OFFLOAD,,}" == auto ]]; then
+        if [[ "$MODE" == switchdev ]]; then
+            ENABLE_HW_TC_OFFLOAD=true
+        else
+            ENABLE_HW_TC_OFFLOAD=false
+        fi
+    else
+        ENABLE_HW_TC_OFFLOAD=$(normalize_bool "$ENABLE_HW_TC_OFFLOAD") || \
+            die "ENABLE_HW_TC_OFFLOAD must be auto, true, or false."
+    fi
     OVS_HW_OFFLOAD=$(normalize_bool "$OVS_HW_OFFLOAD") || \
         die "OVS_HW_OFFLOAD must be true or false."
 
@@ -526,13 +648,27 @@ validate_settings() {
         fi
     fi
 
-    if [[ "$MAC_MODE" == move-pf-to-vf0 || "$SET_MAX_RING" == true ]]; then
+    if [[ "$MAC_MODE" == move-pf-to-vf0 || "$SET_MAX_RING" == true ||
+          "$ENABLE_HW_TC_OFFLOAD" == true ]]; then
         command_exists ethtool || die "The 'ethtool' command is required."
     fi
 
     FLOW_STEERING_MODE="${FLOW_STEERING_MODE,,}"
     INLINE_MODE="${INLINE_MODE,,}"
     ENCAP_MODE="${ENCAP_MODE,,}"
+
+    if [[ "$FLOW_STEERING_MODE" == recommended ]]; then
+        if [[ "$MODE" == switchdev && "$DRIVER" == mlx5_core ]]; then
+            FLOW_STEERING_MODE=smfs
+        else
+            FLOW_STEERING_MODE=auto
+        fi
+    fi
+    if [[ "$INLINE_MODE" == recommended ]]; then
+        # Modern mlx5 and ice drivers select the correct inline mode. Do not
+        # force transport unless a legacy config explicitly requests it.
+        INLINE_MODE=auto
+    fi
 
     case "$INLINE_MODE" in
         auto|none|link|network|transport) ;;
@@ -672,7 +808,7 @@ configure_vf_rings() {
 }
 
 configure_representors() {
-    local iface port_output
+    local iface
     local representor_count=0
     local -a netdevs=()
 
@@ -682,15 +818,7 @@ configure_representors() {
     echo "    Setting UP: $PF_DEV (uplink)"
     ip link set dev "$PF_DEV" up
 
-    if ! port_output=$(get_devlink_ports "$PF_PCI"); then
-        warn "Could not list devlink ports for $PF_PCI."
-        return 0
-    fi
-    mapfile -t netdevs < <(
-        awk '{for (i=1; i<=NF; i++) if ($i == "netdev") print $(i+1)}' \
-            <<<"$port_output" | sort -u
-    )
-
+    mapfile -t netdevs < <(get_representor_netdevs "$PF_PCI" "$PF_DEV")
     for iface in "${netdevs[@]}"; do
         [[ -n "$iface" && "$iface" != "$PF_DEV" ]] || continue
         [[ -e "$SYSFS_ROOT/class/net/$iface" ]] || continue
@@ -702,6 +830,48 @@ configure_representors() {
 
     if (( representor_count == 0 )); then
         warn "No VF representor netdevs were found for $PF_PCI after creating $TOTAL_VFS VFs."
+    fi
+    return 0
+}
+
+configure_hw_tc_offload() {
+    local iface features state
+    local supported_count=0
+    local enabled_count=0
+    local -a netdevs=()
+
+    [[ "$ENABLE_HW_TC_OFFLOAD" == true ]] || return 0
+
+    echo "Enabling hardware TC offload on all managed NIC ports..."
+    mapfile -t netdevs < <(get_managed_netdevs "$PF_PCI" "$PF_DEV")
+    for iface in "${netdevs[@]}"; do
+        [[ -n "$iface" && -e "$SYSFS_ROOT/class/net/$iface" ]] || continue
+        if ! features=$(ethtool -k "$iface" 2>/dev/null); then
+            echo "    TC offload: $iface (features unavailable, skipped)"
+            continue
+        fi
+        state=$(awk '$1 == "hw-tc-offload:" {print $2; exit}' <<<"$features")
+        if [[ -z "$state" ]]; then
+            echo "    TC offload: $iface (not supported, skipped)"
+            continue
+        fi
+
+        ((supported_count += 1))
+        if [[ "$state" == on ]]; then
+            echo "    TC offload: $iface already on"
+            ((enabled_count += 1))
+        elif ethtool -K "$iface" hw-tc-offload on 2>/dev/null; then
+            echo "    TC offload: $iface off -> on"
+            ((enabled_count += 1))
+        else
+            warn "Could not enable hw-tc-offload on $iface (state: $state)."
+        fi
+    done
+
+    if (( supported_count == 0 )); then
+        warn "None of the managed netdevs expose hw-tc-offload."
+    else
+        echo "    TC offload: enabled on $enabled_count/$supported_count supported port(s)."
     fi
     return 0
 }
@@ -719,6 +889,7 @@ VFs:                $TOTAL_VFS (maximum $MAX_VFS)
 MAC policy:         $MAC_MODE
 VF MAC prefix:      ${VF_PREFIX:-n/a}
 Max ring sizes:     $SET_MAX_RING
+NIC TC offload:     $ENABLE_HW_TC_OFFLOAD
 OVS boot offload:   $OVS_HW_OFFLOAD
 EOF
 }
@@ -778,6 +949,7 @@ apply_configuration() {
     configure_mac_addresses
     set_max_ring "$PF_DEV"
     configure_representors
+    configure_hw_tc_offload
 
     echo ">>> Configuration complete: $PF_DEV has $actual VF(s) in $MODE mode."
     if [[ "$MODE" == switchdev ]]; then
@@ -813,6 +985,7 @@ save_config_file() {
         printf 'VF_PREFIX=%q\n' "$VF_PREFIX"
         printf 'SET_MAX_RING=%q\n' "$SET_MAX_RING"
         printf 'BRING_REPRESENTORS_UP=%q\n' "$BRING_REPRESENTORS_UP"
+        printf 'ENABLE_HW_TC_OFFLOAD=%q\n' "$ENABLE_HW_TC_OFFLOAD"
         printf 'FLOW_STEERING_MODE=%q\n' "$FLOW_STEERING_MODE"
         printf 'INLINE_MODE=%q\n' "$INLINE_MODE"
         printf 'ENCAP_MODE=%q\n' "$ENCAP_MODE"
