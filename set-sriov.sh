@@ -11,6 +11,17 @@ INTERACTIVE=false
 LIST_ONLY=false
 SAVE_CONFIG=""
 SAVED_CONFIG_PATH=""
+INTERACTIVE_ACTION=configure
+UNIT_PATH="${SRIOV_UNIT_PATH:-/etc/systemd/system/sriov-nic.service}"
+SYSTEMCTL="${SRIOV_SYSTEMCTL:-systemctl}"
+INSTALLED_SCRIPT_DIR=""
+CURRENT_VFS=0
+CURRENT_ESWITCH_MODE=unknown
+UNINSTALL_REMOVE_CONFIGS=false
+UNINSTALL_REMOVE_SERVICE=false
+UNINSTALL_RESTORE_MAC=false
+UNINSTALL_PERMANENT_MAC=""
+declare -a EXISTING_CONFIGS=()
 
 # Runtime configuration. These are populated by a config file or the wizard.
 MODE=""
@@ -364,6 +375,174 @@ prompt_yes_no() {
     done
 }
 
+get_installed_script_dir() {
+    local exec_path
+
+    [[ -r "$UNIT_PATH" ]] || return 1
+    exec_path=$(awk -F= '
+        $1 == "ExecStart" && $2 ~ /\/set-sriov-all\.sh([[:space:]]|$)/ {
+            value = substr($0, index($0, "=") + 1)
+            sub(/^[[:space:]-]+/, "", value)
+            sub(/[[:space:]].*$/, "", value)
+            sub(/\/set-sriov-all\.sh$/, "", value)
+            print value
+            exit
+        }
+    ' "$UNIT_PATH")
+    [[ -n "$exec_path" && -d "$exec_path" ]] || return 1
+    printf '%s\n' "$exec_path"
+}
+
+read_config_pf_pci() {
+    local file="$1"
+
+    (
+        set +u
+        unset PF_PCI
+        # Configs are trusted shell fragments, as in load_config(). Keep any
+        # output suppressed while inspecting their PF identity.
+        # shellcheck source=/dev/null
+        source "$file" >/dev/null 2>&1 || exit 1
+        [[ -n "${PF_PCI:-}" ]] || exit 1
+        printf '%s\n' "$PF_PCI"
+    )
+}
+
+collect_existing_configs() {
+    local file config_pci
+
+    EXISTING_CONFIGS=()
+    INSTALLED_SCRIPT_DIR=$(get_installed_script_dir 2>/dev/null || true)
+    [[ -n "$INSTALLED_SCRIPT_DIR" && -d "$INSTALLED_SCRIPT_DIR" ]] || return 1
+
+    # Only configs referenced by the installed service count as an existing
+    # installation. Ad-hoc configs in the current checkout are runtime/manual
+    # state and naturally disappear after a reboot when no service reapplies them.
+    for file in "$INSTALLED_SCRIPT_DIR"/sriov-nic.conf*; do
+        [[ -f "$file" ]] || continue
+        config_pci=$(read_config_pf_pci "$file" 2>/dev/null || true)
+        [[ -n "$config_pci" ]] || continue
+        config_pci=$(normalize_pci "$config_pci")
+        [[ "$config_pci" == "$PF_PCI" ]] || continue
+        EXISTING_CONFIGS+=("$file")
+    done
+    (( ${#EXISTING_CONFIGS[@]} > 0 ))
+}
+
+service_has_other_configs() {
+    local file selected match
+
+    [[ -n "$INSTALLED_SCRIPT_DIR" && -d "$INSTALLED_SCRIPT_DIR" ]] || return 1
+    for file in "$INSTALLED_SCRIPT_DIR"/sriov-nic.conf*; do
+        [[ -f "$file" ]] || continue
+        match=false
+        for selected in "${EXISTING_CONFIGS[@]}"; do
+            if [[ "$(readlink -f "$file" 2>/dev/null || printf '%s' "$file")" == \
+                  "$(readlink -f "$selected" 2>/dev/null || printf '%s' "$selected")" ]]; then
+                match=true
+                break
+            fi
+        done
+        [[ "$match" == true ]] || return 0
+    done
+    return 1
+}
+
+get_permanent_mac() {
+    local iface="$1"
+    local mac
+
+    command_exists ethtool || return 1
+    mac=$(ethtool -P "$iface" 2>/dev/null |
+        awk -F': ' '/Permanent address:/{print tolower($2); exit}' || true)
+    [[ "$mac" =~ ^[[:xdigit:]]{2}(:[[:xdigit:]]{2}){5}$ ]] || return 1
+    printf '%s\n' "$mac"
+}
+
+detect_existing_setup() {
+    local info
+
+    # Presence of an installed unit plus a matching config defines an old
+    # installation. Runtime-only VFs/switchdev state are deliberately ignored.
+    [[ -r "$UNIT_PATH" ]] || return 1
+    collect_existing_configs || return 1
+
+    CURRENT_VFS=$(<"$SYSFS_ROOT/bus/pci/devices/$PF_PCI/sriov_numvfs")
+    CURRENT_ESWITCH_MODE=unsupported
+    if info=$(get_eswitch_info "$PF_PCI"); then
+        CURRENT_ESWITCH_MODE=$(get_eswitch_mode "$info")
+    fi
+    return 0
+}
+
+prepare_uninstall_interactive() {
+    local current_mac file
+
+    INTERACTIVE_ACTION=uninstall
+    UNINSTALL_REMOVE_CONFIGS=false
+    UNINSTALL_REMOVE_SERVICE=false
+    UNINSTALL_RESTORE_MAC=false
+    UNINSTALL_PERMANENT_MAC=""
+
+    echo
+    echo "Existing SR-IOV setup detected for $PF_DEV ($PF_PCI):"
+    echo "  Active VFs:       $CURRENT_VFS"
+    echo "  E-switch mode:    $CURRENT_ESWITCH_MODE"
+    if (( ${#EXISTING_CONFIGS[@]} > 0 )); then
+        echo "  Saved configs:"
+        for file in "${EXISTING_CONFIGS[@]}"; do
+            echo "    $file"
+        done
+        if prompt_yes_no "Remove these saved configs during uninstall?" yes; then
+            UNINSTALL_REMOVE_CONFIGS=true
+        fi
+    else
+        echo "  Saved configs:    none found"
+    fi
+
+    current_mac=$(cat "$SYSFS_ROOT/class/net/$PF_DEV/address" 2>/dev/null || true)
+    UNINSTALL_PERMANENT_MAC=$(get_permanent_mac "$PF_DEV" 2>/dev/null || true)
+    if [[ -n "$UNINSTALL_PERMANENT_MAC" && "$current_mac" != "$UNINSTALL_PERMANENT_MAC" ]]; then
+        echo "  Current PF MAC:   $current_mac"
+        echo "  Permanent PF MAC: $UNINSTALL_PERMANENT_MAC"
+        if prompt_yes_no "Restore the PF permanent MAC?" yes; then
+            UNINSTALL_RESTORE_MAC=true
+        fi
+    fi
+
+    if [[ -r "$UNIT_PATH" ]]; then
+        if service_has_other_configs; then
+            echo "  Service retained: other sriov-nic.conf* files still depend on it."
+        elif [[ "$UNINSTALL_REMOVE_CONFIGS" == true || ${#EXISTING_CONFIGS[@]} -eq 0 ]]; then
+            if prompt_yes_no "Disable and remove the now-unused sriov-nic.service?" yes; then
+                UNINSTALL_REMOVE_SERVICE=true
+            fi
+        fi
+    fi
+}
+
+choose_existing_setup_action() {
+    local answer
+
+    detect_existing_setup || return 0
+    echo
+    echo "An existing setup was found for $PF_DEV ($PF_PCI):"
+    echo "  VFs=$CURRENT_VFS, e-switch=$CURRENT_ESWITCH_MODE, configs=${#EXISTING_CONFIGS[@]}"
+    echo "  1) Reconfigure/update this PF"
+    echo "  2) Uninstall this PF configuration"
+    echo "  3) Cancel"
+    while true; do
+        read -r -p "Select action [1]: " answer
+        answer="${answer:-1}"
+        case "$answer" in
+            1) return 0 ;;
+            2) prepare_uninstall_interactive; return 0 ;;
+            3) die "Cancelled; no changes were made." ;;
+            *) echo "Invalid selection." ;;
+        esac
+    done
+}
+
 default_vf_prefix() {
     local pci="$1"
     if [[ "$pci" =~ ^([[:xdigit:]]{4}):([[:xdigit:]]{2}):([[:xdigit:]]{2})\.([0-7])$ ]]; then
@@ -393,28 +572,15 @@ get_pf_base_mac() {
     printf '%s\n' "$mac"
 }
 
-generate_pf_oui_random_prefix() {
+generate_pf_oui_invert_prefix() {
     local iface="$1"
-    local mac o1 o2 o3 o4 o5 _last_octet r4="" r5="" bytes
-    local tries
+    local mac o1 o2 o3 o4 o5 _last_octet i4 i5
 
     mac=$(get_pf_base_mac "$iface") || return 1
     IFS=: read -r o1 o2 o3 o4 o5 _last_octet <<<"$mac"
-
-    for ((tries = 0; tries < 16; tries++)); do
-        if [[ -r /dev/urandom ]] && command_exists od; then
-            bytes=$(od -An -N2 -tx1 /dev/urandom 2>/dev/null || true)
-            read -r r4 r5 <<<"$bytes"
-        else
-            printf -v r4 '%02x' "$((RANDOM & 255))"
-            printf -v r5 '%02x' "$((RANDOM & 255))"
-        fi
-        [[ "$r4" =~ ^[[:xdigit:]]{2}$ && "$r5" =~ ^[[:xdigit:]]{2}$ ]] || continue
-        [[ "$r4:$r5" != "$o4:$o5" && "$r4:$r5" != 00:00 ]] || continue
-        printf '%s:%s:%s:%s:%s\n' "$o1" "$o2" "$o3" "$r4" "$r5"
-        return 0
-    done
-    return 1
+    printf -v i4 '%02x' "$((16#$o4 ^ 0xff))"
+    printf -v i5 '%02x' "$((16#$o5 ^ 0xff))"
+    printf '%s:%s:%s:%s:%s\n' "$o1" "$o2" "$o3" "$i4" "$i5"
 }
 
 interactive_setup() {
@@ -444,6 +610,9 @@ interactive_setup() {
 
     [[ "$PF_DEV" != '<no-netdev>' ]] || \
         die "The selected PCI function has no netdev; make sure its PF driver is loaded."
+
+    choose_existing_setup_action
+    [[ "$INTERACTIVE_ACTION" != uninstall ]] || return 0
 
     echo
     echo "Operating mode:"
@@ -495,7 +664,7 @@ interactive_setup() {
     echo
     echo "MAC configuration:"
     echo "  1) Leave PF and VF MAC addresses to the driver/hypervisor (safest)"
-    echo "  2) Keep the PF OUI (first 3 octets), randomize octets 4/5, use VF number as octet 6"
+    echo "  2) Keep PF octets 1-3, bitwise-invert octets 4/5, use VF number as octet 6"
     echo "  3) Keep the PF MAC and assign a chosen/generated prefix to all VFs"
     echo "  4) Move the permanent PF MAC to VF 0 (original repository behavior)"
     while true; do
@@ -503,7 +672,7 @@ interactive_setup() {
         answer="${answer:-1}"
         case "$answer" in
             1) MAC_MODE=none; break ;;
-            2) MAC_MODE=pf-oui-random; break ;;
+            2) MAC_MODE=pf-oui-invert; break ;;
             3) MAC_MODE=generated; break ;;
             4) MAC_MODE=move-pf-to-vf0; break ;;
             *) echo "Invalid selection." ;;
@@ -512,10 +681,10 @@ interactive_setup() {
 
     VF_PREFIX=""
     case "$MAC_MODE" in
-        pf-oui-random)
-            VF_PREFIX=$(generate_pf_oui_random_prefix "$PF_DEV") || \
-                die "Could not derive a randomized prefix from the PF MAC."
-            echo "Generated VF MAC prefix: $VF_PREFIX (persisted if the config is saved)"
+        pf-oui-invert)
+            VF_PREFIX=$(generate_pf_oui_invert_prefix "$PF_DEV") || \
+                die "Could not derive the bitwise-inverted prefix from the PF MAC."
+            echo "Derived deterministic VF MAC prefix: $VF_PREFIX"
             ;;
         generated|move-pf-to-vf0)
             default_prefix=$(default_vf_prefix "$PF_PCI")
@@ -619,10 +788,10 @@ validate_settings() {
 
     case "${MAC_MODE,,}" in
         none|off) MAC_MODE=none ;;
-        pf-oui-random|oui-random|preserve-oui-random) MAC_MODE=pf-oui-random ;;
+        pf-oui-invert|oui-invert|pf-oui-random|oui-random|preserve-oui-random) MAC_MODE=pf-oui-invert ;;
         generated|generate) MAC_MODE=generated ;;
         move-pf-to-vf0|legacy) MAC_MODE=move-pf-to-vf0 ;;
-        *) die "MAC_MODE must be none, pf-oui-random, generated, or move-pf-to-vf0." ;;
+        *) die "MAC_MODE must be none, pf-oui-invert, generated, or move-pf-to-vf0." ;;
     esac
 
     SET_MAX_RING=$(normalize_bool "$SET_MAX_RING") || \
@@ -685,6 +854,10 @@ validate_settings() {
             die "Could not determine the e-switch mode of $PF_PCI."
     fi
 
+    if [[ "$MAC_MODE" == pf-oui-invert ]]; then
+        VF_PREFIX=$(generate_pf_oui_invert_prefix "$PF_DEV") || \
+            die "Could not derive the bitwise-inverted prefix from the PF MAC."
+    fi
     if [[ "$MAC_MODE" != none ]]; then
         [[ "$VF_PREFIX" =~ ^[[:xdigit:]]{2}(:[[:xdigit:]]{2}){4}$ ]] || \
             die "VF_PREFIX must contain exactly five MAC octets, e.g. 02:00:00:03:00."
@@ -694,10 +867,10 @@ validate_settings() {
         first_octet="${VF_PREFIX%%:*}"
         (( (16#$first_octet & 1) == 0 )) || \
             die "VF_PREFIX starts with a multicast MAC octet ($first_octet)."
-        if [[ "$MAC_MODE" == pf-oui-random ]]; then
+        if [[ "$MAC_MODE" == pf-oui-invert ]]; then
             local pf_base_mac pf_oui vf_oui
             pf_base_mac=$(get_pf_base_mac "$PF_DEV") || \
-                die "Could not read a valid PF MAC for MAC_MODE=pf-oui-random."
+                die "Could not read a valid PF MAC for MAC_MODE=pf-oui-invert."
             pf_oui="${pf_base_mac%:*:*:*}"
             vf_oui="${VF_PREFIX%:*:*}"
             [[ "$vf_oui" == "$pf_oui" ]] || \
@@ -707,7 +880,7 @@ validate_settings() {
         fi
     fi
 
-    if [[ "$MAC_MODE" == move-pf-to-vf0 || "$MAC_MODE" == pf-oui-random ||
+    if [[ "$MAC_MODE" == move-pf-to-vf0 || "$MAC_MODE" == pf-oui-invert ||
           "$SET_MAX_RING" == true ||
           "$ENABLE_HW_TC_OFFLOAD" == true ]]; then
         command_exists ethtool || die "The 'ethtool' command is required."
@@ -846,9 +1019,9 @@ configure_mac_addresses() {
             echo "Leaving PF/VF MAC addresses unchanged."
             return 0
             ;;
-        generated|pf-oui-random)
-            if [[ "$MAC_MODE" == pf-oui-random ]]; then
-                echo "Assigning PF-OUI randomized MAC addresses to VFs..."
+        generated|pf-oui-invert)
+            if [[ "$MAC_MODE" == pf-oui-invert ]]; then
+                echo "Assigning deterministic PF-OUI inverted MAC addresses to VFs..."
             else
                 echo "Assigning generated MAC addresses to VFs..."
             fi
@@ -988,6 +1161,73 @@ Max ring sizes:     $SET_MAX_RING
 NIC TC offload:     $ENABLE_HW_TC_OFFLOAD
 OVS boot offload:   $OVS_HW_OFFLOAD
 EOF
+}
+
+apply_uninstall() {
+    local sriov_file current info mode file current_mac was_up=false
+
+    sriov_file="$SYSFS_ROOT/bus/pci/devices/$PF_PCI/sriov_numvfs"
+    current=$(<"$sriov_file")
+    echo ">>> Uninstalling SR-IOV setup for $PF_PCI ($PF_DEV)"
+
+    if (( 10#$current > 0 )); then
+        echo "Removing $current active VF(s)..."
+        printf '0\n' >"$sriov_file"
+        settle_devices
+    else
+        echo "No active VFs to remove."
+    fi
+
+    if info=$(get_eswitch_info "$PF_PCI"); then
+        mode=$(get_eswitch_mode "$info")
+        if [[ "$mode" != legacy ]]; then
+            echo "Switching the e-switch from $mode to legacy mode..."
+            devlink dev eswitch set "pci/$PF_PCI" mode legacy
+        else
+            echo "The e-switch is already in legacy mode."
+        fi
+    fi
+
+    if [[ "$UNINSTALL_RESTORE_MAC" == true ]]; then
+        current_mac=$(cat "$SYSFS_ROOT/class/net/$PF_DEV/address" 2>/dev/null || true)
+        if [[ "$current_mac" != "$UNINSTALL_PERMANENT_MAC" ]]; then
+            if ip -o link show dev "$PF_DEV" | grep -qE '(<|,)UP(,|>)'; then
+                was_up=true
+            fi
+            echo "Restoring PF MAC to $UNINSTALL_PERMANENT_MAC..."
+            ip link set dev "$PF_DEV" down
+            if ! ip link set dev "$PF_DEV" address "$UNINSTALL_PERMANENT_MAC"; then
+                [[ "$was_up" == true ]] && ip link set dev "$PF_DEV" up || true
+                die "Failed to restore the PF permanent MAC."
+            fi
+            [[ "$was_up" == true ]] && ip link set dev "$PF_DEV" up
+        fi
+    fi
+
+    if [[ "$UNINSTALL_REMOVE_CONFIGS" == true ]]; then
+        for file in "${EXISTING_CONFIGS[@]}"; do
+            echo "Removing saved config: $file"
+            rm -f -- "$file"
+        done
+    else
+        echo "Saved config retained; the installed service may re-apply this PF on the next boot."
+    fi
+
+    if [[ "$UNINSTALL_REMOVE_SERVICE" == true ]]; then
+        echo "Disabling and removing sriov-nic.service..."
+        if command_exists "$SYSTEMCTL"; then
+            "$SYSTEMCTL" disable --now sriov-nic.service >/dev/null 2>&1 || \
+                warn "Could not disable sriov-nic.service cleanly."
+        fi
+        rm -f -- "$UNIT_PATH"
+        if command_exists "$SYSTEMCTL"; then
+            "$SYSTEMCTL" daemon-reload
+            "$SYSTEMCTL" reset-failed sriov-nic.service >/dev/null 2>&1 || true
+        fi
+    fi
+
+    echo ">>> Uninstall complete for $PF_PCI."
+    echo "    Global OVS hw-offload and per-netdev hw-tc-offload settings were left unchanged."
 }
 
 apply_configuration() {
@@ -1172,6 +1412,18 @@ if [[ "$INTERACTIVE" == true ]]; then
 else
     [[ -z "$SAVE_CONFIG" ]] || die "--save is only valid in interactive mode."
     load_config "$CONFIG_FILE"
+fi
+
+if [[ "$INTERACTIVE_ACTION" == uninstall ]]; then
+    cat <<EOF
+
+WARNING: Uninstalling deletes all VFs on $PF_DEV and may interrupt networking.
+Stop every VM/process using these VFs and use an out-of-band management console.
+EOF
+    read -r -p "Type UNINSTALL to continue: " answer
+    [[ "$answer" == UNINSTALL ]] || die "Cancelled; no changes were made."
+    apply_uninstall
+    exit 0
 fi
 
 validate_settings

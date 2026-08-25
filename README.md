@@ -58,12 +58,13 @@ sudo ./set-sriov.sh --interactive
 
 1. 扫描 `/sys/bus/pci/devices/*/sriov_totalvfs`；
 2. 显示接口名、PCI 地址、驱动、当前/最大 VF 数量和 switchdev 能力；
-3. 选择普通 SR-IOV 或 switchdev；
-4. 选择 VF 数量；
-5. 选择 MAC 策略、ring 调优、NIC TC offload 与 OVS offload；mlx5/ice 会应用各自推荐的 switchdev profile；
-6. 显示摘要，并要求输入大写 `APPLY` 后才执行；
-7. 成功后可保存为 `sriov-nic.conf.<接口名>`；
-8. 若配置保存在脚本目录中，会进一步询问是否**安装并启用** `sriov-nic.service`，让该配置在开机时自动重放。
+3. 选择 PF 后检查已安装的 `sriov-nic.service` 是否管理该 PF；若是，可选择重新配置或交互式卸载；
+4. 新配置时选择普通 SR-IOV 或 switchdev；
+5. 选择 VF 数量；
+6. 选择 MAC 策略、ring 调优、NIC TC offload 与 OVS offload；mlx5/ice 会应用各自推荐的 switchdev profile；
+7. 显示摘要，并要求输入大写 `APPLY` 后才执行；
+8. 成功后可保存为 `sriov-nic.conf.<接口名>`；
+9. 若配置保存在脚本目录中，会进一步询问是否**安装并启用** `sriov-nic.service`，让该配置在开机时自动重放。
 
 只查看可用 PF，不修改系统：
 
@@ -76,6 +77,34 @@ sudo ./set-sriov.sh --interactive
 ```bash
 sudo ./set-sriov.sh --interactive --save ./sriov-nic.conf.pf0
 ```
+
+## 交互式卸载已安装配置
+
+仓库没有独立的 uninstall 命令。交互向导在选择 PF 后，仅在同时满足以下条件时显示卸载选项：
+
+1. 存在 `/etc/systemd/system/sriov-nic.service`（测试/打包时可通过 `SRIOV_UNIT_PATH` 覆盖）；
+2. unit 的 `ExecStart` 指向一个有效的 sriov-nic 安装目录；
+3. 该安装目录中至少一个 `sriov-nic.conf*` 的 `PF_PCI` 与所选 PF 匹配。
+
+单纯手动运行过脚本、当前存在 VF 或 switchdev 状态，但没有安装 service，不视为“旧安装”：本仓库不会在下次开机重放它，通常会随驱动重载/重启恢复。
+
+检测到安装后菜单为：
+
+```text
+1) Reconfigure/update this PF
+2) Uninstall this PF configuration
+3) Cancel
+```
+
+交互式卸载可以：
+
+- 将所选 PF 的 `sriov_numvfs` 清零；
+- 将支持 e-switch 的设备切回 legacy；
+- 当 PF 当前 MAC 与永久 MAC 不同时，询问是否恢复永久 MAC；
+- 询问是否删除 service 安装目录中与该 PF 匹配的配置文件；
+- 如果 service 没有其他 PF 配置依赖，询问是否 disable 并删除 unit；多 PF 安装只删除所选 PF 配置并保留共享 service。
+
+卸载不会删除整个旧仓库目录，也不会自动关闭全局 OVS `hw-offload` 或接口 `hw-tc-offload`，因为这些设置可能仍被其他网卡使用。卸载要求输入大写 `UNINSTALL` 二次确认，并同样应通过带外管理通道执行。
 
 ## 普通 SR-IOV：Intel XXV710 示例
 
@@ -190,7 +219,7 @@ devlink port show pci/0000:03:00.0
 | `PF_PCI` | 如 `0000:03:00.0` | PF 的完整 PCI 地址 |
 | `TOTAL_VFS` | 正整数 | VF 数量，不得超过 `sriov_totalvfs` |
 | `MAC_MODE` | `none` | 不修改 PF/VF MAC，推荐默认值 |
-|  | `pf-oui-random` | 保留 PF MAC 前三字节（OUI），随机生成第 4/5 字节，并用 VF 序号作为第 6 字节 |
+|  | `pf-oui-invert` | 保留 PF MAC 前三字节，第 4/5 字节逐位取反，并用 VF 序号作为第 6 字节；结果确定 |
 |  | `generated` | 为全部 VF 设置 `VF_PREFIX:00`、`:01`…… |
 |  | `move-pf-to-vf0` | 将 PF 永久 MAC 交给 VF 0，并修改 PF MAC；兼容原仓库行为 |
 | `VF_PREFIX` | 五个 MAC 字节 | 如 `02:00:00:03:00`；每张 PF 应唯一 |
@@ -223,22 +252,26 @@ MAC_MODE=none
 
 这样不会修改 PF MAC，VF MAC 可由 Proxmox、libvirt 或后续的 `ip link set ... vf ... mac ...` 设置。
 
-如需保留网卡厂商 OUI、但为 VF 使用新的地址空间，可在交互向导选择第 2 项：
+如需保留网卡厂商 OUI、但为 VF 使用确定的新地址空间，可在交互向导选择第 2 项：
 
 ```bash
-MAC_MODE=pf-oui-random
-VF_PREFIX=b8:3f:d2:12:34
+MAC_MODE=pf-oui-invert
 ```
 
-假设 PF 永久 MAC 为 `b8:3f:d2:fb:a6:f6`，脚本会保留前三字节 `b8:3f:d2`，随机生成第 4/5 字节（示例为 `12:34`），然后生成：
+假设 PF 永久 MAC 为 `b8:3f:d2:fb:a6:f6`，脚本保留前三字节，并把第 4/5 字节逐位取反：
 
 ```text
-VF0 b8:3f:d2:12:34:00
-VF1 b8:3f:d2:12:34:01
+fb XOR ff = 04
+a6 XOR ff = 59
+
+VF0 b8:3f:d2:04:59:00
+VF1 b8:3f:d2:04:59:01
 ...
 ```
 
-随机前缀会写入保存的配置，因此开机重放时保持不变。该模式保留的是厂商 OUI，而不是本地管理位，理论上可能与同 OUI 的真实设备地址冲突；多台主机使用时应检查前缀唯一性。手写配置时必须显式提供与 PF OUI 一致的五字节 `VF_PREFIX`。
+该算法没有随机数，同一 PF 每次运行都会得到同一个结果；`VF_PREFIX` 会在运行时从 PF 永久 MAC 重新推导。旧配置名 `pf-oui-random` 仍作为兼容别名接受，但也会使用新的确定性取反算法。
+
+该模式保留的是厂商 OUI，而不是本地管理位，理论上仍可能与同 OUI 的真实设备地址冲突；多台主机使用时应检查前缀唯一性。
 
 如需使用本地管理地址并固定 VF MAC，可以使用：
 
