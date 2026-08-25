@@ -302,21 +302,23 @@ sudo ./set-sriov-all.sh
 
 ## 开机自动配置
 
-交互向导在配置保存到脚本目录后，会直接询问是否**安装并启用** `sriov-nic.service`；同意后它会调用 `set-systemd-service.sh` 并执行 `systemctl enable sriov-nic.service`。
+交互向导在网卡配置成功并将配置保存到脚本目录后，会询问是否**安装并启用** `sriov-nic.service`；选择安装后才进一步询问是否在该 boot service 中启用 OVS hardware offload。它会调用 `set-systemd-service.sh` 并执行 `systemctl enable sriov-nic.service`，但不会立即启动 service。
 
 也可以手动执行（效果相同）：
 
 ```bash
 sudo ./set-systemd-service.sh          # 生成 /etc/systemd/system/sriov-nic.service
 sudo systemctl enable sriov-nic.service
+sudo reboot
 ```
 
 请先手动应用并确认配置正确，且项目目录要放在固定路径（如 `/opt/sriov-nic`），因为生成的 unit 中保存的是绝对路径。安装服务后不要移动或删除该目录。
 
-测试服务：
+不要在 PF 已属于正在运行的 OVS bridge 时直接执行 `systemctl start sriov-nic.service`：Intel `ice` 会以 `Uplink port cannot be a bridge port` 拒绝初始化 switchdev。应 enable 后重启，让 systemd 在 `ovs-vswitchd` 挂载 PF 之前配置网卡。
+
+重启后检查：
 
 ```bash
-sudo systemctl start sriov-nic.service
 systemctl status sriov-nic.service
 journalctl -u sriov-nic.service -b --no-pager
 ```
@@ -327,19 +329,19 @@ journalctl -u sriov-nic.service -b --no-pager
 OVS_HW_OFFLOAD=true
 ```
 
-服务会按以下顺序执行：
+systemd 顺序为：
 
 ```text
-1. set-sriov-all.sh：创建 VF/representor、切换 switchdev、开启 NIC hw-tc-offload
-2. prepare-ovs.sh：设置 OVS hw-offload=true 并重启 Open vSwitch
+sriov-nic（明确 Before=ovs-vswitchd/openvswitch-switch）：
+  创建 VF/representor、切换 switchdev、开启 NIC hw-tc-offload
+→ prepare-ovs --defer-restart：按需确保 ovsdb-server 可用，只把 hw-offload=true 写入 OVSDB
+→ ovs-vswitchd/openvswitch-switch 正常启动，从 OVSDB 恢复 bridge/port
+→ networking
 ```
 
-即 OVS 重启发生在网卡和 representor 准备完成之后：
+`ovsdb-server` 只是数据库，不会把 PF 挂进 bridge；它可以在 sriov-nic 之前或期间独立启动，关键约束是 `ovs-vswitchd` 必须在 sriov-nic 完成之后启动。
 
-```bash
-ovs-vsctl set Open_vSwitch . other_config:hw-offload=true
-systemctl restart openvswitch-switch.service
-```
+这样 OVS 转发进程只会在网卡和 representor 准备完成之后启动，不会提前把 PF 设置为 `master ovs-system`。延迟模式不会在 sriov-nic service 内重启 OVS；手动直接运行 `prepare-ovs.sh` 时仍保留立即启动/重启 OVS 的行为。
 
 没有配置请求 OVS offload 时，不会要求安装或重启 OVS。
 

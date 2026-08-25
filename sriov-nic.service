@@ -1,13 +1,13 @@
 [Unit]
-Description=Configure SR-IOV NIC physical functions
+Description=Configure SR-IOV NIC physical functions before Open vSwitch
 After=systemd-modules-load.service systemd-udev-settle.service network-pre.target
-Before=networking.service
+Before=ovs-vswitchd.service openvswitch-switch.service networking.service
 Wants=systemd-udev-settle.service network-pre.target
 
 [Service]
 Type=oneshot
 ExecStart=%INSTALL_DIR%/set-sriov-all.sh
-ExecStartPost=%INSTALL_DIR%/prepare-ovs.sh
+ExecStartPost=%INSTALL_DIR%/prepare-ovs.sh --defer-restart
 RemainAfterExit=yes
 TimeoutStartSec=180
 

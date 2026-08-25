@@ -24,5 +24,7 @@ chmod 0644 "$UNIT_PATH"
 "$SYSTEMCTL" daemon-reload
 
 echo "Installed $UNIT_PATH"
-echo "Enable it after testing your configuration manually:"
-echo "  $SYSTEMCTL enable --now sriov-nic.service"
+echo "Enable it, then reboot so NIC setup runs before ovs-vswitchd:"
+echo "  $SYSTEMCTL enable sriov-nic.service"
+echo "  reboot"
+echo "Do not start it directly while the PF is attached to a running OVS bridge."

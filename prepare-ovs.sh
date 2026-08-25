@@ -4,6 +4,13 @@ set -Eeuo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 shopt -s nullglob
 
+defer_restart=false
+case "${1:-}" in
+    "") ;;
+    --defer-restart) defer_restart=true ;;
+    *) echo "Usage: $0 [--defer-restart]" >&2; exit 2 ;;
+esac
+
 need_hw_offload=false
 configs=("$SCRIPT_DIR"/sriov-nic.conf*)
 
@@ -43,6 +50,20 @@ command -v systemctl >/dev/null 2>&1 || {
     echo "Error: OVS_HW_OFFLOAD=true, but systemctl is unavailable." >&2
     exit 1
 }
+
+if [[ "$defer_restart" == true ]]; then
+    # sriov-nic.service is ordered after ovsdb-server but before ovs-vswitchd.
+    # Start only the database if this helper was invoked manually outside that
+    # boot transaction. Do not start the forwarding daemon before switchdev and
+    # representors are fully prepared.
+    if ! systemctl is-active --quiet ovsdb-server.service; then
+        echo "Starting the Open vSwitch database only..."
+        systemctl start ovsdb-server.service
+    fi
+    echo "Enabling Open vSwitch hardware offload in OVSDB (daemon start deferred)..."
+    ovs-vsctl set Open_vSwitch . other_config:hw-offload=true
+    exit 0
+fi
 
 if ! systemctl is-active --quiet openvswitch-switch.service; then
     echo "Starting Open vSwitch..."
