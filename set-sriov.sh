@@ -3,7 +3,7 @@ set -Eeuo pipefail
 export LC_ALL=C
 
 SCRIPT_NAME="$(basename "$0")"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 SYSFS_ROOT="${SYSFS_ROOT:-/sys}"
 
 CONFIG_FILE=""
@@ -727,10 +727,6 @@ interactive_setup() {
         if ! prompt_yes_no "Enable hardware TC offload on all managed NIC ports?" yes; then
             ENABLE_HW_TC_OFFLOAD=false
         fi
-        if command_exists ovs-vsctl &&
-           prompt_yes_no "Enable Open vSwitch hardware offload when saved configs run at boot?" yes; then
-            OVS_HW_OFFLOAD=true
-        fi
     fi
 }
 
@@ -1146,6 +1142,11 @@ configure_hw_tc_offload() {
 }
 
 print_summary() {
+    local ovs_summary="$OVS_HW_OFFLOAD"
+
+    if [[ "$INTERACTIVE" == true && "$MODE" == switchdev ]]; then
+        ovs_summary="asked after successful NIC apply"
+    fi
     cat <<EOF
 
 Configuration summary
@@ -1159,7 +1160,7 @@ MAC policy:         $MAC_MODE
 VF MAC prefix:      ${VF_PREFIX:-n/a}
 Max ring sizes:     $SET_MAX_RING
 NIC TC offload:     $ENABLE_HW_TC_OFFLOAD
-OVS boot offload:   $OVS_HW_OFFLOAD
+OVS boot offload:   $ovs_summary
 EOF
 }
 
@@ -1304,6 +1305,7 @@ save_config_file() {
     fi
     directory=$(dirname "$path")
     [[ -d "$directory" ]] || die "Directory '$directory' does not exist."
+    path="$(cd "$directory" && pwd -P)/$(basename "$path")"
 
     if [[ -e "$path" ]] && ! prompt_yes_no "Overwrite $path?" no; then
         echo "Configuration was not saved."
@@ -1349,6 +1351,44 @@ install_boot_service() {
     fi
     systemctl enable sriov-nic.service
     echo "sriov-nic.service installed and enabled; configs will be re-applied on boot."
+}
+
+finish_interactive_setup() {
+    local target="" absolute_target="" target_dir
+    local install_requested=false
+
+    if [[ -n "$SAVE_CONFIG" ]]; then
+        target="$SAVE_CONFIG"
+    elif prompt_yes_no "Save this working configuration for set-sriov-all.sh/systemd?" no; then
+        target="$SCRIPT_DIR/sriov-nic.conf.$PF_DEV"
+    fi
+    [[ -n "$target" ]] || return 0
+
+    absolute_target="$target"
+    [[ "$absolute_target" == /* ]] || absolute_target="$PWD/$absolute_target"
+    target_dir=$(dirname "$absolute_target")
+    [[ -d "$target_dir" ]] || die "Directory '$target_dir' does not exist."
+    absolute_target="$(cd "$target_dir" && pwd -P)/$(basename "$absolute_target")"
+
+    OVS_HW_OFFLOAD=false
+    if [[ "$absolute_target" == "$SCRIPT_DIR"/sriov-nic.conf* ]]; then
+        if prompt_yes_no "Install/update and enable sriov-nic.service for this config?" no; then
+            install_requested=true
+            if [[ "$MODE" == switchdev ]] && command_exists ovs-vsctl &&
+               prompt_yes_no "Enable Open vSwitch hardware offload in that service?" yes; then
+                OVS_HW_OFFLOAD=true
+            fi
+        fi
+    fi
+
+    save_config_file "$absolute_target"
+    if [[ "$install_requested" == true && -n "$SAVED_CONFIG_PATH" ]]; then
+        install_boot_service
+    elif [[ "$SAVED_CONFIG_PATH" != "$SCRIPT_DIR"/sriov-nic.conf* ]]; then
+        echo "Note: the saved config is outside the script directory, so the boot"
+        echo "      service will not load it automatically. To use boot-time"
+        echo "      re-application, save it into $SCRIPT_DIR as sriov-nic.conf*."
+    fi
 }
 
 while (( $# > 0 )); do
@@ -1443,21 +1483,5 @@ fi
 apply_configuration
 
 if [[ "$INTERACTIVE" == true ]]; then
-    if [[ -n "$SAVE_CONFIG" ]]; then
-        save_config_file "$SAVE_CONFIG"
-    elif prompt_yes_no "Save this working configuration for set-sriov-all.sh/systemd?" no; then
-        save_config_file "$SCRIPT_DIR/sriov-nic.conf.$PF_DEV"
-    fi
-
-    if [[ -n "$SAVED_CONFIG_PATH" ]]; then
-        if [[ "$SAVED_CONFIG_PATH" == "$SCRIPT_DIR"/sriov-nic.conf* ]]; then
-            if prompt_yes_no "Install and enable sriov-nic.service to re-apply this config on boot?" no; then
-                install_boot_service
-            fi
-        else
-            echo "Note: the saved config is outside the script directory, so the boot"
-            echo "      service will not load it automatically. To use boot-time"
-            echo "      re-application, save it into $SCRIPT_DIR as sriov-nic.conf*."
-        fi
-    fi
+    finish_interactive_setup
 fi

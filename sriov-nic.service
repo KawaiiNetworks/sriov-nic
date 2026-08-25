@@ -6,8 +6,8 @@ Wants=systemd-udev-settle.service network-pre.target
 
 [Service]
 Type=oneshot
-ExecStartPre=%INSTALL_DIR%/prepare-ovs.sh
 ExecStart=%INSTALL_DIR%/set-sriov-all.sh
+ExecStartPost=%INSTALL_DIR%/prepare-ovs.sh
 RemainAfterExit=yes
 TimeoutStartSec=180
 

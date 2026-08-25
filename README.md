@@ -61,9 +61,9 @@ sudo ./set-sriov.sh --interactive
 3. 选择 PF 后检查已安装的 `sriov-nic.service` 是否管理该 PF；若是，可选择重新配置或交互式卸载；
 4. 新配置时选择普通 SR-IOV 或 switchdev；
 5. 选择 VF 数量；
-6. 选择 MAC 策略、ring 调优、NIC TC offload 与 OVS offload；mlx5/ice 会应用各自推荐的 switchdev profile；
-7. 显示摘要，并要求输入大写 `APPLY` 后才执行；
-8. 成功后可保存为 `sriov-nic.conf.<接口名>`；
+6. 选择 MAC 策略、ring 调优和 NIC TC offload；mlx5/ice 会应用各自推荐的 switchdev profile；
+7. 显示摘要，并要求输入大写 `APPLY` 后才执行网卡配置；
+8. 网卡配置成功后，才询问是否保存、是否在 boot service 中启用 OVS offload；
 9. 若配置保存在脚本目录中，会进一步询问是否**安装并启用** `sriov-nic.service`，让该配置在开机时自动重放。
 
 只查看可用 PF，不修改系统：
@@ -327,7 +327,14 @@ journalctl -u sriov-nic.service -b --no-pager
 OVS_HW_OFFLOAD=true
 ```
 
-服务会先执行：
+服务会按以下顺序执行：
+
+```text
+1. set-sriov-all.sh：创建 VF/representor、切换 switchdev、开启 NIC hw-tc-offload
+2. prepare-ovs.sh：设置 OVS hw-offload=true 并重启 Open vSwitch
+```
+
+即 OVS 重启发生在网卡和 representor 准备完成之后：
 
 ```bash
 ovs-vsctl set Open_vSwitch . other_config:hw-offload=true
