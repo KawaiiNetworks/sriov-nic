@@ -188,6 +188,7 @@ devlink port show pci/0000:03:00.0
 | `PF_PCI` | 如 `0000:03:00.0` | PF 的完整 PCI 地址 |
 | `TOTAL_VFS` | 正整数 | VF 数量，不得超过 `sriov_totalvfs` |
 | `MAC_MODE` | `none` | 不修改 PF/VF MAC，推荐默认值 |
+|  | `pf-oui-random` | 保留 PF MAC 前三字节（OUI），随机生成第 4/5 字节，并用 VF 序号作为第 6 字节 |
 |  | `generated` | 为全部 VF 设置 `VF_PREFIX:00`、`:01`…… |
 |  | `move-pf-to-vf0` | 将 PF 永久 MAC 交给 VF 0，并修改 PF MAC；兼容原仓库行为 |
 | `VF_PREFIX` | 五个 MAC 字节 | 如 `02:00:00:03:00`；每张 PF 应唯一 |
@@ -220,7 +221,24 @@ MAC_MODE=none
 
 这样不会修改 PF MAC，VF MAC 可由 Proxmox、libvirt 或后续的 `ip link set ... vf ... mac ...` 设置。
 
-如需固定 VF MAC，可以使用：
+如需保留网卡厂商 OUI、但为 VF 使用新的地址空间，可在交互向导选择第 2 项：
+
+```bash
+MAC_MODE=pf-oui-random
+VF_PREFIX=b8:3f:d2:12:34
+```
+
+假设 PF 永久 MAC 为 `b8:3f:d2:fb:a6:f6`，脚本会保留前三字节 `b8:3f:d2`，随机生成第 4/5 字节（示例为 `12:34`），然后生成：
+
+```text
+VF0 b8:3f:d2:12:34:00
+VF1 b8:3f:d2:12:34:01
+...
+```
+
+随机前缀会写入保存的配置，因此开机重放时保持不变。该模式保留的是厂商 OUI，而不是本地管理位，理论上可能与同 OUI 的真实设备地址冲突；多台主机使用时应检查前缀唯一性。手写配置时必须显式提供与 PF OUI 一致的五字节 `VF_PREFIX`。
+
+如需使用本地管理地址并固定 VF MAC，可以使用：
 
 ```bash
 MAC_MODE=generated

@@ -376,6 +376,46 @@ default_vf_prefix() {
     fi
 }
 
+get_pf_base_mac() {
+    local iface="$1"
+    local mac=""
+
+    if command_exists ethtool; then
+        mac=$(ethtool -P "$iface" 2>/dev/null |
+            awk -F': ' '/Permanent address:/{print tolower($2); exit}' || true)
+    fi
+    if [[ ! "$mac" =~ ^[[:xdigit:]]{2}(:[[:xdigit:]]{2}){5}$ ]]; then
+        mac=$(tr '[:upper:]' '[:lower:]' \
+            <"$SYSFS_ROOT/class/net/$iface/address" 2>/dev/null || true)
+    fi
+    [[ "$mac" =~ ^[[:xdigit:]]{2}(:[[:xdigit:]]{2}){5}$ ]] || return 1
+    printf '%s\n' "$mac"
+}
+
+generate_pf_oui_random_prefix() {
+    local iface="$1"
+    local mac o1 o2 o3 o4 o5 _last_octet r4="" r5="" bytes
+    local tries
+
+    mac=$(get_pf_base_mac "$iface") || return 1
+    IFS=: read -r o1 o2 o3 o4 o5 _last_octet <<<"$mac"
+
+    for ((tries = 0; tries < 16; tries++)); do
+        if [[ -r /dev/urandom ]] && command_exists od; then
+            bytes=$(od -An -N2 -tx1 /dev/urandom 2>/dev/null || true)
+            read -r r4 r5 <<<"$bytes"
+        else
+            printf -v r4 '%02x' "$((RANDOM & 255))"
+            printf -v r5 '%02x' "$((RANDOM & 255))"
+        fi
+        [[ "$r4" =~ ^[[:xdigit:]]{2}$ && "$r5" =~ ^[[:xdigit:]]{2}$ ]] || continue
+        [[ "$r4:$r5" != "$o4:$o5" && "$r4:$r5" != 00:00 ]] || continue
+        printf '%s:%s:%s:%s:%s\n' "$o1" "$o2" "$o3" "$r4" "$r5"
+        return 0
+    done
+    return 1
+}
+
 interactive_setup() {
     local choice index default_vfs answer default_prefix
 
@@ -454,25 +494,34 @@ interactive_setup() {
     echo
     echo "MAC configuration:"
     echo "  1) Leave PF and VF MAC addresses to the driver/hypervisor (safest)"
-    echo "  2) Keep the PF MAC and assign generated MAC addresses to all VFs"
-    echo "  3) Move the permanent PF MAC to VF 0 (original repository behavior)"
+    echo "  2) Keep the PF OUI (first 3 octets), randomize octets 4/5, use VF number as octet 6"
+    echo "  3) Keep the PF MAC and assign a chosen/generated prefix to all VFs"
+    echo "  4) Move the permanent PF MAC to VF 0 (original repository behavior)"
     while true; do
         read -r -p "Select MAC policy [1]: " answer
         answer="${answer:-1}"
         case "$answer" in
             1) MAC_MODE=none; break ;;
-            2) MAC_MODE=generated; break ;;
-            3) MAC_MODE=move-pf-to-vf0; break ;;
+            2) MAC_MODE=pf-oui-random; break ;;
+            3) MAC_MODE=generated; break ;;
+            4) MAC_MODE=move-pf-to-vf0; break ;;
             *) echo "Invalid selection." ;;
         esac
     done
 
     VF_PREFIX=""
-    if [[ "$MAC_MODE" != none ]]; then
-        default_prefix=$(default_vf_prefix "$PF_PCI")
-        read -r -p "Five-byte VF MAC prefix [$default_prefix]: " VF_PREFIX
-        VF_PREFIX="${VF_PREFIX:-$default_prefix}"
-    fi
+    case "$MAC_MODE" in
+        pf-oui-random)
+            VF_PREFIX=$(generate_pf_oui_random_prefix "$PF_DEV") || \
+                die "Could not derive a randomized prefix from the PF MAC."
+            echo "Generated VF MAC prefix: $VF_PREFIX (persisted if the config is saved)"
+            ;;
+        generated|move-pf-to-vf0)
+            default_prefix=$(default_vf_prefix "$PF_PCI")
+            read -r -p "Five-byte VF MAC prefix [$default_prefix]: " VF_PREFIX
+            VF_PREFIX="${VF_PREFIX:-$default_prefix}"
+            ;;
+    esac
 
     if prompt_yes_no "Set supported RX/TX ring sizes to their maximum?" yes; then
         SET_MAX_RING=true
@@ -569,9 +618,10 @@ validate_settings() {
 
     case "${MAC_MODE,,}" in
         none|off) MAC_MODE=none ;;
+        pf-oui-random|oui-random|preserve-oui-random) MAC_MODE=pf-oui-random ;;
         generated|generate) MAC_MODE=generated ;;
         move-pf-to-vf0|legacy) MAC_MODE=move-pf-to-vf0 ;;
-        *) die "MAC_MODE must be none, generated, or move-pf-to-vf0." ;;
+        *) die "MAC_MODE must be none, pf-oui-random, generated, or move-pf-to-vf0." ;;
     esac
 
     SET_MAX_RING=$(normalize_bool "$SET_MAX_RING") || \
@@ -643,12 +693,21 @@ validate_settings() {
         first_octet="${VF_PREFIX%%:*}"
         (( (16#$first_octet & 1) == 0 )) || \
             die "VF_PREFIX starts with a multicast MAC octet ($first_octet)."
-        if (( (16#$first_octet & 2) == 0 )); then
+        if [[ "$MAC_MODE" == pf-oui-random ]]; then
+            local pf_base_mac pf_oui vf_oui
+            pf_base_mac=$(get_pf_base_mac "$PF_DEV") || \
+                die "Could not read a valid PF MAC for MAC_MODE=pf-oui-random."
+            pf_oui="${pf_base_mac%:*:*:*}"
+            vf_oui="${VF_PREFIX%:*:*}"
+            [[ "$vf_oui" == "$pf_oui" ]] || \
+                die "VF_PREFIX OUI ($vf_oui) does not match PF OUI ($pf_oui)."
+        elif (( (16#$first_octet & 2) == 0 )); then
             warn "VF_PREFIX is not locally administered; a prefix beginning with 02 is recommended."
         fi
     fi
 
-    if [[ "$MAC_MODE" == move-pf-to-vf0 || "$SET_MAX_RING" == true ||
+    if [[ "$MAC_MODE" == move-pf-to-vf0 || "$MAC_MODE" == pf-oui-random ||
+          "$SET_MAX_RING" == true ||
           "$ENABLE_HW_TC_OFFLOAD" == true ]]; then
         command_exists ethtool || die "The 'ethtool' command is required."
     fi
@@ -754,8 +813,12 @@ configure_mac_addresses() {
             echo "Leaving PF/VF MAC addresses unchanged."
             return 0
             ;;
-        generated)
-            echo "Assigning generated MAC addresses to VFs..."
+        generated|pf-oui-random)
+            if [[ "$MAC_MODE" == pf-oui-random ]]; then
+                echo "Assigning PF-OUI randomized MAC addresses to VFs..."
+            else
+                echo "Assigning generated MAC addresses to VFs..."
+            fi
             for ((i = 0; i < TOTAL_VFS; i++)); do
                 printf -v suffix '%02x' "$i"
                 mac="$VF_PREFIX:$suffix"
