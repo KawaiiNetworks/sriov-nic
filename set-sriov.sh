@@ -962,6 +962,12 @@ set_optional_devlink_param() {
         return 0
     fi
 
+    current=$(get_devlink_param_runtime_value "$name" || true)
+    if [[ -n "$current" && "$current" == "$value" ]]; then
+        echo "Devlink parameter $name is already $value; skipped."
+        return 0
+    fi
+
     echo "Setting devlink parameter $name=$value..."
     if error_output=$(devlink dev param set "pci/$PF_PCI" name "$name" \
         value "$value" cmode runtime 2>&1); then
@@ -984,11 +990,19 @@ set_optional_devlink_param() {
 set_optional_eswitch_attr() {
     local attr="$1"
     local value="$2"
-    local info
+    local info current=""
 
     [[ "$value" != auto && -n "$value" ]] || return 0
     info=$(get_eswitch_info "$PF_PCI")
     if grep -q -- "$attr" <<<"$info"; then
+        current=$(awk -v attr="$attr" '{
+            for (i = 1; i <= NF; i++)
+                if ($i == attr) {print $(i + 1); exit}
+        }' <<<"$info")
+        if [[ -n "$current" && "$current" == "$value" ]]; then
+            echo "E-switch $attr is already $value; skipped."
+            return 0
+        fi
         echo "Setting e-switch $attr=$value..."
         devlink dev eswitch set "pci/$PF_PCI" "$attr" "$value"
     else
@@ -1232,7 +1246,8 @@ apply_uninstall() {
 }
 
 apply_configuration() {
-    local sriov_file current eswitch_info current_mode actual
+    local sriov_file current eswitch_info current_mode=unsupported actual
+    local target_mode=legacy mode_change=false recreate_vfs=false
 
     sriov_file="$SYSFS_ROOT/bus/pci/devices/$PF_PCI/sriov_numvfs"
 
@@ -1245,39 +1260,59 @@ apply_configuration() {
     fi
 
     current=$(<"$sriov_file")
+    if eswitch_info=$(get_eswitch_info "$PF_PCI"); then
+        current_mode=$(get_eswitch_mode "$eswitch_info")
+    fi
+    [[ "$MODE" == switchdev ]] && target_mode=switchdev
+
+    if [[ "$current_mode" != unsupported && "$current_mode" != "$target_mode" ]]; then
+        mode_change=true
+        recreate_vfs=true
+    elif (( 10#$current != TOTAL_VFS )); then
+        recreate_vfs=true
+    fi
+
     echo ">>> Configuring $PF_PCI ($PF_DEV, driver $DRIVER) in $MODE mode"
-    echo "Removing $current existing VF(s)..."
-    printf '0\n' >"$sriov_file"
-    settle_devices
+    if [[ "$recreate_vfs" == true ]]; then
+        echo "Removing $current existing VF(s)..."
+        printf '0\n' >"$sriov_file"
+        settle_devices
+    else
+        echo "Reusing $current existing VF(s); mode/count already match."
+    fi
 
     if [[ "$MODE" == switchdev ]]; then
         set_optional_devlink_param flow_steering_mode "$FLOW_STEERING_MODE" \
             "$FLOW_STEERING_RECOMMENDED"
 
-        echo "Switching the e-switch to switchdev mode..."
-        devlink dev eswitch set "pci/$PF_PCI" mode switchdev
+        if [[ "$mode_change" == true ]]; then
+            echo "Switching the e-switch from $current_mode to switchdev mode..."
+            devlink dev eswitch set "pci/$PF_PCI" mode switchdev
+        else
+            echo "The e-switch is already in switchdev mode; skipping mode change."
+        fi
         set_optional_eswitch_attr inline-mode "$INLINE_MODE"
         set_optional_eswitch_attr encap-mode "$ENCAP_MODE"
     else
-        if ! command_exists devlink; then
-            warn "devlink is unavailable, so the script cannot detect or force legacy e-switch mode."
-            echo "Using ordinary SR-IOV sysfs controls directly."
-        elif eswitch_info=$(get_eswitch_info "$PF_PCI"); then
-            current_mode=$(get_eswitch_mode "$eswitch_info")
-            if [[ "$current_mode" != legacy ]]; then
-                echo "Switching the e-switch from $current_mode to legacy mode..."
-                devlink dev eswitch set "pci/$PF_PCI" mode legacy
+        if [[ "$current_mode" == unsupported ]]; then
+            if ! command_exists devlink; then
+                warn "devlink is unavailable, so the script cannot detect or force legacy e-switch mode."
             else
-                echo "The e-switch is already in legacy mode."
+                echo "The driver has no devlink e-switch mode; using ordinary SR-IOV directly."
             fi
+        elif [[ "$mode_change" == true ]]; then
+            echo "Switching the e-switch from $current_mode to legacy mode..."
+            devlink dev eswitch set "pci/$PF_PCI" mode legacy
         else
-            echo "The driver has no devlink e-switch mode; using ordinary SR-IOV directly."
+            echo "The e-switch is already in legacy mode; skipping mode change."
         fi
     fi
 
-    echo "Creating $TOTAL_VFS VF(s)..."
-    printf '%s\n' "$TOTAL_VFS" >"$sriov_file"
-    settle_devices
+    if [[ "$recreate_vfs" == true ]]; then
+        echo "Creating $TOTAL_VFS VF(s)..."
+        printf '%s\n' "$TOTAL_VFS" >"$sriov_file"
+        settle_devices
+    fi
 
     actual=$(<"$sriov_file")
     [[ "$actual" == "$TOTAL_VFS" ]] || \

@@ -207,7 +207,7 @@ devlink dev eswitch show pci/0000:03:00.0
 devlink port show pci/0000:03:00.0
 ```
 
-脚本在切换模式前会先将 `sriov_numvfs` 设为 `0`，再切换 e-switch，最后重新创建 VF。这同时满足 `ice` 等驱动“存在 VF 时不允许切换模式”的要求。
+目标模式或 VF 数量需要改变时，脚本会先将 `sriov_numvfs` 设为 `0`，再切换 e-switch 并重新创建 VF。这同时满足 `ice` 等驱动“存在 VF 时不允许切换模式”的要求。如果设备已经处于目标模式且 VF 数量一致，则直接复用现有 VF，不重复执行 `devlink ... mode switchdev`，避免 mlx5 在 representor/资源已占用时返回 `device is busy`。
 
 现代 mlx5 内核可能把 Ethernet devlink 端口暴露为父 PCI devlink 的 nested auxiliary 实例，例如 `auxiliary/mlx5_core.eth.0`。脚本会同时遍历父/嵌套 devlink，并在旧版 iproute2 上通过相同 `phys_switch_id` 与 `phys_port_name` 回退识别 representor。
 
