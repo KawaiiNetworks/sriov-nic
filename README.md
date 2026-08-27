@@ -240,7 +240,7 @@ devlink port show pci/0000:03:00.0
 - `ENABLE_HW_TC_OFFLOAD=true` 为所选 PF 的 uplink、VF/SF representor 和主机可见 VF 执行 `ethtool -K <接口> hw-tc-offload on`；不支持该 feature 的接口会跳过并给出警告。
 - `OVS_HW_OFFLOAD=true` 让开机 helper 设置 OVS 全局 `other_config:hw-offload=true`。延迟启动模式只使用 OVSDB 的 `--no-wait` 写入，不会等待尚未启动的 `ovs-vswitchd`。
 
-使用 Linux bridge 时只需要 NIC 的 `ENABLE_HW_TC_OFFLOAD=true`，必须保持 `OVS_HW_OFFLOAD=false`。交互向导会检查 PF 是否属于 `ovs-system` 或存在于 OVSDB；未检测到 OVS 时不会询问开启 OVS offload。
+不使用 OVS 时只需要 NIC 的 `ENABLE_HW_TC_OFFLOAD=true`，并保持 `OVS_HW_OFFLOAD=false`。配置阶段 PF 通常尚未加入目标 bridge，因此交互向导不会根据当前 master/OVSDB 状态猜测未来拓扑；选择安装 service 后只会询问一次是否使用 Open vSwitch。只有用户回答是才保存 `OVS_HW_OFFLOAD=true`。
 
 OVS TC flower 硬件卸载仍使用默认 `system` datapath；不要把 bridge 的 `datapath_type` 设置为 `tc`。实际卸载还要求 representor 被加入 OVS bridge，这属于网络拓扑配置，不由本项目自动完成。
 
