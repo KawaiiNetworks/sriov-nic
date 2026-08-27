@@ -184,7 +184,7 @@ FLOW_STEERING_MODE=auto
 INLINE_MODE=auto
 ENCAP_MODE=auto
 
-# 使用 OVS hardware offload 时设为 true。
+# 只有 PF/representor 使用 OVS bridge 时设为 true；Linux bridge 必须为 false。
 OVS_HW_OFFLOAD=true
 ```
 
@@ -229,7 +229,7 @@ devlink port show pci/0000:03:00.0
 | `FLOW_STEERING_MODE` | `recommended` / `auto` / `dmfs` / `smfs` / 驱动值 | `recommended` 在 mlx5 尝试 `smfs` 并自动回退到当前值；`auto` 表示不修改；显式值设置失败会退出 |
 | `INLINE_MODE` | `recommended` / `auto` / `none` / `link` / `network` / `transport` | `recommended` 使用网卡 profile；`auto` 表示不修改 e-switch 当前值 |
 | `ENCAP_MODE` | `auto` / `none` / `basic` | 可选 e-switch 属性 |
-| `OVS_HW_OFFLOAD` | `true` / `false` | 开机服务是否启用并重启 OVS；普通 SR-IOV 应为 `false` |
+| `OVS_HW_OFFLOAD` | `true` / `false` | 是否把 OVS 全局 `hw-offload=true` 写入 OVSDB；Linux bridge 和普通 SR-IOV 应为 `false` |
 
 配置文件通过 Bash `source` 加载，因此只应使用自己信任的配置文件。
 
@@ -238,7 +238,9 @@ devlink port show pci/0000:03:00.0
 两项配置彼此独立：
 
 - `ENABLE_HW_TC_OFFLOAD=true` 为所选 PF 的 uplink、VF/SF representor 和主机可见 VF 执行 `ethtool -K <接口> hw-tc-offload on`；不支持该 feature 的接口会跳过并给出警告。
-- `OVS_HW_OFFLOAD=true` 让开机 helper 设置 OVS 全局 `other_config:hw-offload=true` 并重启 OVS。
+- `OVS_HW_OFFLOAD=true` 让开机 helper 设置 OVS 全局 `other_config:hw-offload=true`。延迟启动模式只使用 OVSDB 的 `--no-wait` 写入，不会等待尚未启动的 `ovs-vswitchd`。
+
+使用 Linux bridge 时只需要 NIC 的 `ENABLE_HW_TC_OFFLOAD=true`，必须保持 `OVS_HW_OFFLOAD=false`。交互向导会检查 PF 是否属于 `ovs-system` 或存在于 OVSDB；未检测到 OVS 时不会询问开启 OVS offload。
 
 OVS TC flower 硬件卸载仍使用默认 `system` datapath；不要把 bridge 的 `datapath_type` 设置为 `tc`。实际卸载还要求 representor 被加入 OVS bridge，这属于网络拓扑配置，不由本项目自动完成。
 
@@ -334,14 +336,14 @@ systemd 顺序为：
 ```text
 sriov-nic（明确 Before=ovs-vswitchd/openvswitch-switch）：
   创建 VF/representor、切换 switchdev、开启 NIC hw-tc-offload
-→ prepare-ovs --defer-restart：按需确保 ovsdb-server 可用，只把 hw-offload=true 写入 OVSDB
+→ prepare-ovs --defer-restart：按需确保 ovsdb-server 可用，用 ovs-vsctl --no-wait 写入 hw-offload=true
 → ovs-vswitchd/openvswitch-switch 正常启动，从 OVSDB 恢复 bridge/port
 → networking
 ```
 
 `ovsdb-server` 只是数据库，不会把 PF 挂进 bridge；它可以在 sriov-nic 之前或期间独立启动，关键约束是 `ovs-vswitchd` 必须在 sriov-nic 完成之后启动。
 
-这样 OVS 转发进程只会在网卡和 representor 准备完成之后启动，不会提前把 PF 设置为 `master ovs-system`。延迟模式不会在 sriov-nic service 内重启 OVS；手动直接运行 `prepare-ovs.sh` 时仍保留立即启动/重启 OVS 的行为。
+这样 OVS 转发进程只会在网卡和 representor 准备完成之后启动，不会提前把 PF 设置为 `master ovs-system`。`--no-wait` 也避免 `ovs-vsctl` 等待 `ovs-vswitchd`、而 systemd 又让 `ovs-vswitchd` 等待 sriov-nic 的启动死锁。延迟模式不会在 sriov-nic service 内重启 OVS；手动直接运行 `prepare-ovs.sh` 时仍保留立即启动/重启 OVS 的行为。
 
 没有配置请求 OVS offload 时，不会要求安装或重启 OVS。
 

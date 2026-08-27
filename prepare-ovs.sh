@@ -52,16 +52,15 @@ command -v systemctl >/dev/null 2>&1 || {
 }
 
 if [[ "$defer_restart" == true ]]; then
-    # sriov-nic.service is ordered after ovsdb-server but before ovs-vswitchd.
-    # Start only the database if this helper was invoked manually outside that
-    # boot transaction. Do not start the forwarding daemon before switchdev and
-    # representors are fully prepared.
+    # sriov-nic.service is ordered before ovs-vswitchd. Start/use only OVSDB;
+    # never wait for the forwarding daemon here, otherwise ovs-vsctl and
+    # systemd form a dependency deadlock.
     if ! systemctl is-active --quiet ovsdb-server.service; then
         echo "Starting the Open vSwitch database only..."
         systemctl start ovsdb-server.service
     fi
     echo "Enabling Open vSwitch hardware offload in OVSDB (daemon start deferred)..."
-    ovs-vsctl set Open_vSwitch . other_config:hw-offload=true
+    ovs-vsctl --timeout=10 --no-wait set Open_vSwitch . other_config:hw-offload=true
     exit 0
 fi
 

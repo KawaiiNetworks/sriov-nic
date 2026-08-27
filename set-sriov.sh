@@ -72,6 +72,19 @@ command_exists() {
     command -v "$1" >/dev/null 2>&1
 }
 
+pf_uses_ovs() {
+    local master="" bridge=""
+
+    if [[ -L "$SYSFS_ROOT/class/net/$PF_DEV/master" ]]; then
+        master=$(basename "$(readlink -f "$SYSFS_ROOT/class/net/$PF_DEV/master" 2>/dev/null || true)")
+        [[ "$master" == ovs-system ]] && return 0
+    fi
+
+    command_exists ovs-vsctl || return 1
+    bridge=$(ovs-vsctl --timeout=3 iface-to-br "$PF_DEV" 2>/dev/null || true)
+    [[ -n "$bridge" ]]
+}
+
 normalize_bool() {
     case "${1,,}" in
         1|yes|y|true|on)  printf '%s\n' true ;;
@@ -1451,9 +1464,12 @@ finish_interactive_setup() {
     if [[ "$absolute_target" == "$SCRIPT_DIR"/sriov-nic.conf* ]]; then
         if prompt_yes_no "Install/update and enable sriov-nic.service for this config?" no; then
             install_requested=true
-            if [[ "$MODE" == switchdev ]] && command_exists ovs-vsctl &&
-               prompt_yes_no "Enable Open vSwitch hardware offload in that service?" yes; then
-                OVS_HW_OFFLOAD=true
+            if [[ "$MODE" == switchdev ]] && pf_uses_ovs; then
+                if prompt_yes_no "PF $PF_DEV is configured in OVS; enable OVS hardware offload in that service?" yes; then
+                    OVS_HW_OFFLOAD=true
+                fi
+            elif [[ "$MODE" == switchdev ]]; then
+                echo "PF $PF_DEV is not configured in OVS; keeping OVS_HW_OFFLOAD=false (Linux bridge/non-OVS path)."
             fi
         fi
     fi
