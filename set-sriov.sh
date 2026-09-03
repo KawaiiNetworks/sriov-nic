@@ -1419,15 +1419,9 @@ install_boot_service() {
         return 1
     }
 
-    # set-systemd-service.sh renders %INSTALL_DIR% into the unit and reloads
-    # systemd. SRIOV_UNIT_PATH / SRIOV_SYSTEMCTL can override its destinations.
-    "$installer"
-    if ! command_exists systemctl; then
-        warn "systemctl is unavailable; the unit was installed but not enabled."
-        return 1
-    fi
-    systemctl enable sriov-nic.service
-    echo "sriov-nic.service installed and enabled; configs will be re-applied on boot."
+    # Render the unit, reload systemd, and enable it in one operation so the
+    # wizard never prints an obsolete intermediate "enable it" instruction.
+    "$installer" --enable
 }
 
 finish_interactive_setup() {
