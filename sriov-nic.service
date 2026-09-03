@@ -1,7 +1,7 @@
 [Unit]
-Description=Configure SR-IOV NIC physical functions before Open vSwitch
+Description=Configure SR-IOV PF/VF and mlx5 SF/vDPA before networking and guests
 After=systemd-modules-load.service systemd-udev-settle.service network-pre.target
-Before=ovs-vswitchd.service openvswitch-switch.service networking.service
+Before=ovs-vswitchd.service openvswitch-switch.service networking.service pve-guests.service
 Wants=systemd-udev-settle.service network-pre.target
 
 [Service]
@@ -9,7 +9,7 @@ Type=oneshot
 ExecStart=%INSTALL_DIR%/set-sriov-all.sh
 ExecStartPost=%INSTALL_DIR%/prepare-ovs.sh --defer-restart
 RemainAfterExit=yes
-TimeoutStartSec=180
+TimeoutStartSec=300
 
 [Install]
 WantedBy=multi-user.target

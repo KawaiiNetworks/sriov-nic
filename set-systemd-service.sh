@@ -18,7 +18,7 @@ if [[ "$EUID" -ne 0 ]]; then
     exit 1
 fi
 
-for script in set-sriov.sh set-sriov-all.sh prepare-ovs.sh; do
+for script in set-sriov.sh set-sriov-all.sh manage-sf.sh prepare-ovs.sh; do
     [[ -x "$SCRIPT_DIR/$script" ]] || {
         echo "Error: $SCRIPT_DIR/$script is missing or not executable." >&2
         exit 1

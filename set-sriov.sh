@@ -126,6 +126,74 @@ get_devlink_ports() {
     done <<<"$handles" | awk 'NF && !seen[$0]++'
 }
 
+get_sf_ports() {
+    local pci="$1" output
+
+    command_exists devlink || return 0
+    output=$(devlink port show 2>/dev/null) || return 1
+    awk -v prefix="pci/$pci/" '
+        index($1, prefix) == 1 && $0 ~ /flavour pcisf/ {
+            port=$1
+            sub(/:$/, "", port)
+            print port
+        }' <<<"$output"
+}
+
+get_saved_sf_configs() {
+    local pci="$1" file config_pci directory installed_dir
+    local -A seen_dirs=()
+    local -a directories=("$SCRIPT_DIR")
+
+    installed_dir=$(get_installed_script_dir 2>/dev/null || true)
+    [[ -n "$installed_dir" ]] && directories+=("$installed_dir")
+    shopt -s nullglob
+    for directory in "${directories[@]}"; do
+        [[ -d "$directory" && -z "${seen_dirs[$directory]+x}" ]] || continue
+        seen_dirs[$directory]=1
+        for file in "$directory"/sf-nic.conf*; do
+            [[ -f "$file" ]] || continue
+            config_pci=$(
+                set +u
+                unset PF_PCI
+                # SF configs are trusted shell fragments, like PF configs.
+                # shellcheck source=/dev/null
+                source "$file" >/dev/null 2>&1 || exit 1
+                [[ -n "${PF_PCI:-}" ]] || exit 1
+                normalize_pci "$PF_PCI"
+            ) || continue
+            [[ "$config_pci" == "$pci" ]] && printf '%s\n' "$file"
+        done
+    done
+}
+
+assert_no_sf_ports() {
+    local action="$1" output saved_output
+    local -a sf_ports=() saved_configs=()
+
+    if [[ "$DRIVER" == mlx5_core ]]; then
+        output=$(get_sf_ports "$PF_PCI") ||
+            die "Could not inspect existing mlx5 devlink ports before attempting to $action."
+        [[ -z "$output" ]] || mapfile -t sf_ports <<<"$output"
+    fi
+    if [[ "${SRIOV_COORDINATED_SF_RESTORE:-false}" != true ]]; then
+        saved_output=$(get_saved_sf_configs "$PF_PCI")
+        [[ -z "$saved_output" ]] || mapfile -t saved_configs <<<"$saved_output"
+    fi
+    if (( ${#sf_ports[@]} > 0 || ${#saved_configs[@]} > 0 )); then
+        if (( ${#sf_ports[@]} > 0 )); then
+            printf 'Error: Cannot %s while %d mlx5 SF port(s) still exist on %s:\n' \
+                "$action" "${#sf_ports[@]}" "$PF_PCI" >&2
+            printf '  %s\n' "${sf_ports[@]}" >&2
+        fi
+        if (( ${#saved_configs[@]} > 0 )); then
+            printf 'Error: Cannot %s while %d saved SF config(s) still require switchdev on %s:\n' \
+                "$action" "${#saved_configs[@]}" "$PF_PCI" >&2
+            printf '  %s\n' "${saved_configs[@]}" >&2
+        fi
+        die "Detach assigned SFs from their VMs, then delete the SFs/configs with $SCRIPT_DIR/manage-sf.sh before continuing."
+    fi
+}
+
 get_representor_netdevs() {
     local pci="$1"
     local pf_dev="$2"
@@ -433,7 +501,8 @@ service_has_other_configs() {
     local file selected match
 
     [[ -n "$INSTALLED_SCRIPT_DIR" && -d "$INSTALLED_SCRIPT_DIR" ]] || return 1
-    for file in "$INSTALLED_SCRIPT_DIR"/sriov-nic.conf*; do
+    for file in "$INSTALLED_SCRIPT_DIR"/sriov-nic.conf* \
+                "$INSTALLED_SCRIPT_DIR"/sf-nic.conf*; do
         [[ -f "$file" ]] || continue
         match=false
         for selected in "${EXISTING_CONFIGS[@]}"; do
@@ -1222,6 +1291,10 @@ EOF
 apply_uninstall() {
     local sriov_file current info mode file current_mac was_up=false
 
+    # Switching to legacy with an SF still present is invalid. Check before
+    # removing VFs so an uninstall failure does not cause partial disruption.
+    assert_no_sf_ports "uninstall the PF configuration"
+
     sriov_file="$SYSFS_ROOT/bus/pci/devices/$PF_PCI/sriov_numvfs"
     current=$(<"$sriov_file")
     echo ">>> Uninstalling SR-IOV setup for $PF_PCI ($PF_DEV)"
@@ -1306,6 +1379,12 @@ apply_configuration() {
     fi
     [[ "$MODE" == switchdev ]] && target_mode=switchdev
 
+    # Never tear down VFs first and only then discover that mlx5 SFs prevent
+    # the requested switch back to legacy mode.
+    if [[ "$target_mode" == legacy ]]; then
+        assert_no_sf_ports "use legacy mode on $PF_PCI"
+    fi
+
     if [[ "$current_mode" != unsupported && "$current_mode" != "$target_mode" ]]; then
         mode_change=true
         recreate_vfs=true
@@ -1316,6 +1395,10 @@ apply_configuration() {
     echo ">>> Configuring $PF_PCI ($PF_DEV, driver $DRIVER) in $MODE mode"
     echo "    Plan: e-switch ${current_mode}->${target_mode} (change=$mode_change), VFs ${current}->${TOTAL_VFS} (recreate=$recreate_vfs)"
     if [[ "$recreate_vfs" == true ]]; then
+        # mlx5 supports VF/SF coexistence, but changing the SR-IOV allocation
+        # under active SF-backed vDPA devices is deliberately not attempted.
+        # Reapplying an unchanged VF count remains fully idempotent.
+        assert_no_sf_ports "change the VF allocation"
         echo "Removing $current existing VF(s)..."
         printf '0\n' >"$sriov_file"
         settle_devices
@@ -1521,6 +1604,21 @@ fi
 
 if [[ "$INTERACTIVE" == true ]]; then
     [[ -z "$CONFIG_FILE" ]] || die "Interactive mode cannot be combined with a config file."
+    if [[ -z "$SAVE_CONFIG" && -x "$SCRIPT_DIR/manage-sf.sh" ]]; then
+        echo "Network function management:"
+        echo "  1) Configure/uninstall PF and SR-IOV VFs"
+        echo "  2) Manage mlx5 SF-backed hardware vDPA"
+        while true; do
+            read -r -p "Select function [1]: " answer
+            answer="${answer:-1}"
+            case "$answer" in
+                1) break ;;
+                2) exec "$SCRIPT_DIR/manage-sf.sh" --interactive ;;
+                *) echo "Invalid selection." ;;
+            esac
+        done
+        echo
+    fi
     interactive_setup
 else
     [[ -z "$SAVE_CONFIG" ]] || die "--save is only valid in interactive mode."
